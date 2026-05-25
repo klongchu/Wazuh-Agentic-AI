@@ -253,18 +253,35 @@ def history():
     with ST.hist_lock:
         items = [{"id": v["id"], "label": v["label"],
                   "started": v["started"], "ended": v["ended"],
-                  "status": v["status"]}
+                  "status": v["status"],
+                  "report": v.get("report", "")}   # needed for sidebar copy button
                  for v in reversed(list(ST.history.values()))]
     return jsonify(items)
 
 
-@app.route("/history/<run_id>")
+@app.route("/history/<run_id>", methods=["GET"])
 def get_report(run_id):
     with ST.hist_lock:
         item = ST.history.get(run_id)
     if not item:
         return jsonify({"error": "not found"}), 404
     return jsonify(item)
+
+
+@app.route("/history/<run_id>", methods=["DELETE"])
+def delete_report(run_id):
+    with ST.hist_lock:
+        if run_id not in ST.history:
+            return jsonify({"error": "not found"}), 404
+        del ST.history[run_id]
+        try:
+            import json as _json
+            with open(ST.hist_file, "w", encoding="utf-8") as f:
+                _json.dump(list(ST.history.values()), f,
+                           ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning("History save after delete failed: %s", e)
+    return jsonify({"ok": True})
 
 
 @app.route("/schedule", methods=["POST"])
@@ -521,7 +538,8 @@ input:checked+.slider:before{transform:translateX(14px)}
   text-transform:uppercase;letter-spacing:.05em}
 .elapsed{font-size:11px;color:#484f58}
 #live-out{flex:1;padding:14px 20px;overflow-y:auto;font-size:12.5px;
-  line-height:1.7;white-space:pre-wrap;word-break:break-word}
+  line-height:1.7;word-break:break-word;white-space:pre-wrap}
+#live-out.md-body{white-space:normal}
 .status-bar{padding:6px 20px;font-size:11px;color:#8b949e;
   border-top:1px solid #21262d;flex-shrink:0;display:flex;
   align-items:center;gap:8px}
@@ -551,7 +569,7 @@ input:checked+.slider:before{transform:translateX(14px)}
 .report-header{padding:10px 18px;border-bottom:1px solid #30363d;
   font-size:12px;font-weight:600;color:#8b949e;flex-shrink:0}
 #report-out{flex:1;padding:16px 20px;overflow-y:auto;font-size:13px;
-  line-height:1.75;white-space:pre-wrap;word-break:break-word}
+  line-height:1.75;word-break:break-word}
 
 /* Context Q&A */
 .ctx-panel{border-top:1px solid #30363d;padding:10px 18px;flex-shrink:0}
@@ -570,7 +588,33 @@ input:checked+.slider:before{transform:translateX(14px)}
   background:#161b22;border-radius:5px;border:1px solid #30363d;
   line-height:1.6}
 #ctx-src{font-size:10px;color:#484f58;margin-top:4px}
+
+/* Rendered markdown styles */
+.md-body h1,.md-body h2,.md-body h3{color:#58a6ff;margin:10px 0 4px;font-size:13px;font-weight:700}
+.md-body p{margin:0 0 6px}
+.md-body ul,.md-body ol{padding-left:18px;margin:0 0 6px}
+.md-body li{margin:2px 0;line-height:1.6;white-space:normal}
+.md-body strong{color:#e6edf3;font-weight:700}
+.md-body code{background:#21262d;padding:1px 5px;border-radius:3px;font-size:11px}
+.md-body pre{background:#21262d;padding:10px;border-radius:5px;overflow-x:auto;margin:6px 0}
+.md-body table{border-collapse:collapse;width:100%;margin:6px 0;font-size:11px}
+.md-body th,.md-body td{border:1px solid #30363d;padding:4px 8px;text-align:left}
+.md-body th{background:#21262d;color:#58a6ff}
+.md-body hr{border:none;border-top:1px solid #30363d;margin:8px 0}
+.hbtn{margin-left:5px;font-size:10px;padding:2px 7px;background:#21262d;border:1px solid #30363d;border-radius:3px;cursor:pointer}
+.md-body blockquote{border-left:3px solid #30363d;padding-left:10px;color:#8b949e;margin:4px 0}
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+<script>
+if (typeof marked !== 'undefined') {
+  marked.setOptions({
+    breaks: true,      // single newlines become <br>
+    gfm: true,         // github flavoured markdown
+    mangle: false,
+    headerIds: false
+  });
+}
+</script>
 </head>
 <body>
 
@@ -602,7 +646,7 @@ input:checked+.slider:before{transform:translateX(14px)}
       <div class="params">
         <div class="field">
           <label>Min severity</label>
-          <select id="severity">
+                    <select id="severity">
             <option value="2">2</option>
             <option value="3">3</option>
             <option value="4">4</option>
@@ -645,12 +689,12 @@ input:checked+.slider:before{transform:translateX(14px)}
         style="width:52px" onchange="updateSched()">
       <span class="si">hours — severity</span>
       <select id="sched-sev" style="width:160px" onchange="updateSched()">
-        <option value="3">3 - informational</option>
-        <option value="5">5 - user errors</option>
-        <option value="7" selected>7 - bad word/sig</option>
-        <option value="10">10 - multiple errors</option>
-        <option value="12">12 - high importance</option>
-        <option value="14">14 - security event</option>
+        <option value="3">3</option>
+        <option value="5">5</option>
+        <option value="7" selected>7</option>
+        <option value="10">10</option>
+        <option value="12">12</option>
+        <option value="14">14</option>
         <option value="15">15 - exploit successful</option>
       </select>
       <span class="si" id="sched-status" style="margin-left:4px">Off</span>
@@ -661,8 +705,12 @@ input:checked+.slider:before{transform:translateX(14px)}
         <div class="live-dot" id="dot"></div>
         <span class="live-title" id="live-title">Output</span>
         <span class="elapsed" id="elapsed"></span>
+        <button id="copy-live-btn" onclick="copyLive()"
+          style="margin-left:auto;font-size:11px;padding:3px 10px;
+          background:#21262d;color:#8b949e;border:1px solid #30363d;
+          border-radius:4px;cursor:pointer">Copy</button>
       </div>
-      <div id="live-out">Ready. Configure parameters above and click Run now.</div>
+      <div id="live-out" class="md-body">Ready. Configure parameters above and click Run now.</div>
       <div class="status-bar">
         <span id="status-text">idle</span>
         <span style="margin-left:auto" id="last-run"></span>
@@ -688,10 +736,15 @@ input:checked+.slider:before{transform:translateX(14px)}
 
     <!-- Report viewer -->
     <div class="report-main">
-      <div class="report-header" id="report-header">
-        Select an investigation from the sidebar
+      <div class="report-header" id="report-header"
+           style="display:flex;align-items:center;justify-content:space-between">
+        <span id="report-header-text">Select an investigation from the sidebar</span>
+        <button id="copy-btn" onclick="copyReport()"
+          style="font-size:11px;padding:3px 10px;background:#21262d;
+          color:#8b949e;border:1px solid #30363d;border-radius:4px;
+          cursor:pointer;display:none">Copy</button>
       </div>
-      <div id="report-out">
+      <div id="report-out" class="md-body">
         Click any investigation in the sidebar to read its report.
       </div>
 
@@ -751,7 +804,7 @@ document.getElementById('nl-input').addEventListener('keydown', e => {
 });
 
 // ── Run control ───────────────────────────────────────────────────────────────
-let _es=null, _running=false, _t0=0, _timer=null;
+let _es=null, _running=false, _t0=0, _timer=null, _liveBuffer='';
 
 function setRunning(on) {
   _running = on;
@@ -773,7 +826,7 @@ function startRun() {
   const agent = document.getElementById('agent').value.trim();
   // Switch to Run tab so user sees output
   switchTab('run');
-  document.getElementById('live-out').textContent = '';
+  _liveBuffer = ''; document.getElementById('live-out').innerHTML = '';
   document.getElementById('live-title').textContent = 'Output — running';
   setRunning(true);
   _t0 = Date.now();
@@ -785,10 +838,14 @@ function startRun() {
   }, 1000);
   const p = new URLSearchParams({severity: sev, hours, agent});
   _es = new EventSource('/stream?' + p);
+  _liveBuffer = '';
   _es.onmessage = e => {
     if (e.data === '__DONE__') { finish(false); return; }
+    _liveBuffer += e.data;
     const out = document.getElementById('live-out');
-    out.textContent += e.data;
+    // During streaming: plain text with preserved newlines (fast, no broken HTML)
+    // After done: re-render with marked for proper formatting
+    out.textContent = _liveBuffer;
     out.scrollTop = out.scrollHeight;
   };
   _es.onerror = () => finish(true);
@@ -808,6 +865,12 @@ function finish(err) {
     'completed ' + new Date().toLocaleTimeString();
   document.getElementById('elapsed').textContent = '';
   document.getElementById('live-title').textContent = 'Output';
+  // Re-render completed output with markdown
+  const out = document.getElementById('live-out');
+  if (_liveBuffer && typeof marked !== 'undefined') {
+    out.classList.add('md-body');
+    out.innerHTML = marked.parse(_liveBuffer);
+  }
   // Refresh history list silently so Reports tab is up to date
   _loadHistoryData();
 }
@@ -832,18 +895,34 @@ function _renderHistory() {
     el.innerHTML = '<div style="padding:10px;font-size:11px;color:#484f58">No investigations yet.</div>';
     return;
   }
-  el.innerHTML = _histData.map(i =>
-    '<div class="hi' + (i.id === _activeId ? ' active' : '') + '" '
-    + 'onclick="showReport(\'' + i.id + '\')">'
-    + '<div class="hl">' + esc(i.label) + '</div>'
-    + '<div class="hm">'
-    + '<span class="ds ' + i.status + '"></span>'
-    + '<span>' + i.started + (i.ended ? ' — ' + i.ended : '') + '</span>'
-    + '<span style="margin-left:auto;color:'
-    + (i.status==='error' ? '#f85149' : i.status==='running' ? '#3fb950' : '#484f58')
-    + '">' + i.status + '</span>'
-    + '</div></div>'
-  ).join('');
+  el.innerHTML = _histData.map(i => {
+    const active = i.id === _activeId ? ' active' : '';
+    const color  = i.status === 'error' ? '#f85149'
+                 : i.status === 'running' ? '#3fb950' : '#484f58';
+    const copyBtn = (i.status === 'completed' && i.report)
+      ? '<button class="hbtn" data-copy="' + i.id + '" style="color:#8b949e">Copy</button>'
+      : '';
+    const delBtn = '<button class="hbtn" data-del="' + i.id + '" style="color:#f85149">&#x2715;</button>';
+    return '<div class="hi' + active + '" data-id="' + i.id + '">'
+      + '<div class="hl">' + esc(i.label) + '</div>'
+      + '<div class="hm">'
+      + '<span class="ds ' + i.status + '"></span>'
+      + '<span>' + i.started + (i.ended ? ' — ' + i.ended : '') + '</span>'
+      + '<span style="margin-left:auto;color:' + color + '">' + i.status + '</span>'
+      + copyBtn + delBtn
+      + '</div></div>';
+  }).join('');
+
+  // Attach click handlers after render (avoids all escaping issues)
+  el.querySelectorAll('.hi').forEach(div => {
+    div.addEventListener('click', () => showReport(div.dataset.id));
+  });
+  el.querySelectorAll('[data-copy]').forEach(btn => {
+    btn.addEventListener('click', e => { e.stopPropagation(); copySingle(btn.dataset.copy); });
+  });
+  el.querySelectorAll('[data-del]').forEach(btn => {
+    btn.addEventListener('click', e => { e.stopPropagation(); deleteInv(btn.dataset.del); });
+  });
 }
 
 function showReport(id) {
@@ -851,13 +930,17 @@ function showReport(id) {
   fetch('/history/' + id).then(r => r.json()).then(d => {
     const out    = document.getElementById('report-out');
     const header = document.getElementById('report-header');
+    const md = window.marked ? window.marked.parse.bind(window.marked) : (t => t);
     if (d.status === 'running') {
       header.textContent = 'Investigation running — switch to Run tab for live output';
       out.textContent    = 'Report will appear here when the investigation completes.';
     } else {
       header.textContent = d.label || d.id;
-      out.textContent    = d.report || '[No report available]';
+      const reportText   = d.report || '[No report available]';
+      out.innerHTML      = md(reportText);
       out.scrollTop      = 0;
+      const copyBtn = document.getElementById('copy-btn');
+      if (copyBtn) copyBtn.style.display = d.report ? 'inline-block' : 'none';
     }
     _renderHistory();
   });
@@ -865,6 +948,52 @@ function showReport(id) {
 
 function esc(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function copyReport() {
+  const text = document.getElementById('report-out').innerText;
+  const btn  = document.getElementById('copy-btn');
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+  });
+}
+
+function copySingle(id) {
+  const item = _histData.find(i => i.id === id);
+  if (!item || !item.report) return;
+  const btn = document.getElementById('cpybtn-' + id);
+  navigator.clipboard.writeText(item.report).then(() => {
+    if (btn) { btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = 'Copy'; }, 2000); }
+  });
+}
+
+function deleteInv(id) {
+  if (!confirm('Delete this investigation?')) return;
+  fetch('/history/' + id, {method: 'DELETE'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        if (_activeId === id) {
+          document.getElementById('report-out').innerHTML = '';
+          const ht = document.getElementById('report-header-text');
+          if (ht) ht.textContent = 'Select an investigation from the sidebar';
+          const cb = document.getElementById('copy-btn');
+          if (cb) cb.style.display = 'none';
+          _activeId = null;
+        }
+        _loadHistoryData();
+      }
+    });
+}
+
+function copyLive() {
+  const text = _liveBuffer;
+  const btn  = document.getElementById('copy-live-btn');
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+  });
 }
 
 // ── Context Q&A ───────────────────────────────────────────────────────────────
@@ -934,6 +1063,7 @@ def main():
     p.add_argument("--host",     type=str, default=os.getenv("UI_HOST", "0.0.0.0"))
     p.add_argument("--log-file", type=str, default=os.getenv("LOG_FILE", ""),
                    dest="log_file")
+
     args = p.parse_args()
 
     ST.log_file = args.log_file
