@@ -73,49 +73,242 @@ ST = State()
 
 # ── Natural language parser ───────────────────────────────────────────────────
 def parse_nl(text):
+    """
+    Parse a natural language query into action parameters.
+    Returns a dict with:
+      - intent:   "investigate" | "hunt_ioc" | "hunt_ttp"
+      - For investigate: severity, hours, agent, summary
+      - For hunt:        query, days, agent, hunt_type, summary
+    """
     t   = text.lower().strip()
     out = {
-        "severity": int(os.getenv("MIN_SEVERITY", 7)),
+        "intent":   "investigate",
+        "severity": int(os.getenv("MIN_SEVERITY",    7)),
         "hours":    int(os.getenv("LOOK_BACK_HOURS", 24)),
         "agent":    "",
         "notes":    [],
     }
-    # Agent
-    m = re.search(r"\bagent\s+(?:id\s+)?(\d{1,3})\b", t)
+
+    # ── Detect hunt intent ────────────────────────────────────────────────────
+    # IOC patterns: IP, hash, CVE, domain-like strings
+    import re as _re
+    _IP   = _re.compile(r"(\d{1,3}\.){3}\d{1,3}")
+    _HASH = _re.compile(r"[0-9a-fA-F]{32,64}")
+    _CVE  = _re.compile(r"cve-\d{4}-\d+", _re.I)
+
+    # Hunt trigger words
+    HUNT_WORDS = ["search", "find", "hunt", "look for", "scan for",
+                  "detect", "any sign of", "appeared", "activities",
+                  "across all", "across agents", "in the logs", "occurrences of"]
+    IOC_WORDS  = ["ip", "address", "hash", "domain", "cve", "indicator",
+                  "ioc", "malicious ip", "suspicious ip"]
+    TTP_WORDS  = ["pass the hash", "mimikatz", "lateral movement", "psexec",
+                  "scheduled task", "process injection", "powershell abuse",
+                  "credential dump", "wmi", "persistence", "reconnaissance",
+                  "port scan", "malware", "ransomware", "technique", "tactic",
+                  "ttp", "mitre"]
+
+    is_hunt_trigger = any(w in t for w in HUNT_WORDS)
+    is_ioc_content  = (_IP.search(text) or _HASH.search(text) or
+                       _CVE.search(t)   or any(w in t for w in IOC_WORDS))
+    is_ttp_content  = any(w in t for w in TTP_WORDS)
+
+    # Threat-category intent — high-level analyst questions.
+    # These map to bundles of detection patterns (a whole attack class).
+    THREAT_PATTERNS = {
+        "exfiltration": ["exfiltrat", "data exfil", "data leav", "data steal",
+                         "data loss", "leaking data", "stealing data"],
+        "rce":          ["remote code execution", "remote command", "rce",
+                         "code execution", "remote execution"],
+        "privesc":      ["privilege escalation", "privesc", "escalat",
+                         "elevation", "gained admin", "became admin"],
+        "persistence":  ["persistence", "persist", "foothold", "backdoor"],
+        "credential_access": ["credential access", "credential theft",
+                              "stolen credential", "credential harvest",
+                              "dumping credential", "stealing password"],
+        "lateral":      ["lateral movement", "moving laterally", "pivot",
+                         "spreading across", "moving between"],
+        "defense_evasion": ["defense evasion", "evading", "evasion",
+                            "covering tracks", "hiding", "anti-forensic"],
+        "critical":     ["critical alert", "urgent attention", "require attention",
+                         "need attention", "most severe", "highest severity",
+                         "what should i", "what needs", "top priority",
+                         "requires urgent", "most important"],
+    }
+    threat_cat = None
+    for cat, patterns in THREAT_PATTERNS.items():
+        if any(p in t for p in patterns):
+            threat_cat = cat
+            break
+
+    if threat_cat:
+        out["intent"]       = "threat_category"
+        out["threat_cat"]   = threat_cat
+        # time: reuse the investigate-style hour parsing below by jumping there
+        m = _re.search(r"(\d+)\s*(day|days|d\b)", t)
+        if m:
+            out["hours"] = int(m.group(1)) * 24
+        else:
+            m = _re.search(r"(\d+)\s*(h\b|hr\b|hour|hours)", t)
+            if m:          out["hours"] = int(m.group(1))
+            elif "week"  in t: out["hours"] = 168
+            elif "today" in t: out["hours"] = 24
+            else:              out["hours"] = 24
+        # Extract agent if mentioned
+        am = _re.search(r"\bagent\s+(?:id\s+)?(\d{1,3})\b", t)
+        if am:
+            out["agent"] = am.group(1).zfill(3)
+        period = (f"last {out['hours']//24}d" if out["hours"]>=24 and out["hours"]%24==0
+                  else f"last {out['hours']}h")
+        out["notes"] = [period]
+        if out["agent"]:
+            out["notes"].append(f"agent {out['agent']}")
+        out["summary"] = "  |  ".join(out["notes"])
+        return out
+
+    # Inventory intent — "packages/ports/processes/files on agent X"
+    # Includes fuzzy matching so common typos (pacakges, proceses) still resolve.
+    import difflib as _difflib
+    INV_MAP = {
+        "packages":  ["package", "packages", "installed software", "software"],
+        "ports":     ["port", "ports", "listening", "open port"],
+        "processes": ["process", "processes", "running process", "running processes"],
+        "files":     ["file change", "files changed", "file integrity",
+                      "fim", "modified files", "changed files"],
+    }
+    inv_kind = None
+    # 1. Exact substring match first
+    for kind, words in INV_MAP.items():
+        if any(w in t for w in words):
+            inv_kind = kind
+            break
+    # 2. Fuzzy match on individual words (catches typos like "pacakges")
+    if not inv_kind:
+        canonical = {"package": "packages", "packages": "packages",
+                     "port": "ports", "ports": "ports",
+                     "process": "processes", "processes": "processes",
+                     "file": "files", "files": "files"}
+        for word in t.split():
+            match = _difflib.get_close_matches(word, canonical.keys(),
+                                               n=1, cutoff=0.8)
+            if match:
+                inv_kind = canonical[match[0]]
+                break
+
+    if inv_kind:
+        out["intent"]    = "inventory"
+        out["inv_kind"]  = inv_kind
+        out["only_suspicious"] = any(w in t for w in
+            ["suspicious", "malicious", "flagged", "dangerous", "unusual"])
+    elif is_ioc_content and (is_hunt_trigger or not is_ttp_content):
+        out["intent"] = "hunt_ioc"
+    elif is_ttp_content and is_hunt_trigger:
+        out["intent"] = "hunt_ttp"
+    elif is_hunt_trigger and not is_ioc_content and not is_ttp_content:
+        out["intent"] = "hunt_ttp"
+
+    # ── Extract agent (common to all intents) ─────────────────────────────────
+    m = _re.search(r"\bagent\s+(?:id\s+)?(\d{1,3})\b", t)
     if m:
         out["agent"] = m.group(1).zfill(3)
         out["notes"].append(f"agent {out['agent']}")
-    elif re.search(r"\ball\s+agents?\b|\bevery\s+agent\b", t):
+    elif _re.search(r"\ball\s+agents?\b|\bevery\s+agent\b", t):
         out["notes"].append("all agents")
 
-    # Time
-    m = re.search(r"(?:past|last|for the past|in the last)\s+(\d+)\s*(h\b|hr\b|hour|hours)", t)
-    if m:
-        out["hours"] = int(m.group(1))
-    else:
-        m = re.search(r"(\d+)\s*(h\b|hr\b|hours?)", t)
-        if m:          out["hours"] = int(m.group(1))
-        elif "week"   in t: out["hours"] = 168
-        elif "today"  in t: out["hours"] = 24
-        elif re.search(r"last\s+hour|past\s+hour|this\s+hour", t):
-            out["hours"] = 1
-    out["notes"].append(f"last {out['hours']}h")
+    if out["intent"] == "inventory":
+        if out.get("only_suspicious"):
+            out["notes"].append(f"suspicious {out['inv_kind']} only")
+        else:
+            out["notes"].append(out["inv_kind"])
+        if out["agent"]:
+            out["notes"].append(f"agent {out['agent']}")
+        else:
+            out["notes"].append("NO AGENT — required")
+        out["summary"] = "  |  ".join(out["notes"])
+        return out
 
-    # Severity
-    m = re.search(r"(?:severity|level)\s*(\d+)", t)
-    if m:
-        out["severity"] = int(m.group(1))
+    if out["intent"] in ("hunt_ioc", "hunt_ttp"):
+        # Extract days for hunt (default 7)
+        m = _re.search(r"(\d+)\s*hours?\b", t)
+        if m:
+            # hours → round up to at least 1 day for the date range
+            hrs = int(m.group(1))
+            out["days"] = max(1, round(hrs / 24))
+        else:
+            m = _re.search(r"(\d+)\s*days?\b", t)
+            if m:
+                out["days"] = int(m.group(1))
+            elif "week" in t:
+                out["days"] = 7
+            elif "month" in t:
+                out["days"] = 30
+            else:
+                out["days"] = 7
+
+        # Extract the core hunt query — strip trigger/time phrases using
+        # WORD BOUNDARIES so we never eat letters inside real words
+        # (e.g. "has" must not match inside "hash").
+        query = text
+        strip_phrases = [
+            r"\bsearch for\b", r"\bhunt for\b", r"\bhunt\b",
+            r"\blook for\b", r"\bscan for\b", r"\bsearch\b",
+            r"\bdetect\b", r"\bany sign of\b", r"\bshow me\b",
+            r"\bcheck if\b", r"\bcheck for\b", r"\bfind\b",
+            r"\bappeared\b", r"\bacross all agents\b",
+            r"\bacross agents\b", r"\bin the logs\b",
+            r"\bduring\b", r"\boccou?red\b", r"\boccurred\b",
+            r"\bthe last\b", r"\blast\b", r"\bpast\b",
+            r"\bthis week\b", r"\bthis month\b",
+            r"\d+\s*hours?\b", r"\d+\s*days?\b",
+            r"\bweek\b", r"\bmonth\b",
+                    r"\bactivities\b", r"\bactivity\b", r"\boccurrences? of\b",
+            r"\bevents?\b", r"\blogs?\b", r"\balerts?\b",
+        ]
+        if out["agent"]:
+            strip_phrases.append(rf"\bagent\s+(?:id\s+)?{out['agent'].lstrip('0') or '0'}\b")
+            strip_phrases.append(rf"\bagent\s+(?:id\s+)?{out['agent']}\b")
+        for pat in strip_phrases:
+            query = _re.sub(pat, " ", query, flags=_re.I)
+        # Collapse whitespace and trim stray punctuation
+        query = _re.sub(r"\s+", " ", query).strip(" ?,.-")
+        out["query"]      = query or text
+        out["hunt_type"]  = "ioc" if out["intent"] == "hunt_ioc" else "ttp"
+        out["notes"].append(f"hunt: {out['query'][:40]}")
+        out["notes"].append(f"last {out['days']}d")
     else:
-        if   "critical" in t: out["severity"] = 12
-        elif "high"     in t: out["severity"] = 10
-        elif "medium"   in t: out["severity"] = 7
-        elif re.search(r"\blow\b|\ball\b|\beverything\b|\bany\b", t):
-            out["severity"] = 3
-    out["notes"].append(f"severity >= {out['severity']}")
+        # ── Investigate parameters ────────────────────────────────────────────
+        # Days first (e.g. "last 7 days"), then hours, then named periods.
+        m = _re.search(r"(\d+)\s*(day|days|d\b)", t)
+        if m:
+            out["hours"] = int(m.group(1)) * 24
+        else:
+            m = _re.search(r"(\d+)\s*(h\b|hr\b|hour|hours)", t)
+            if m:
+                out["hours"] = int(m.group(1))
+            elif "week"  in t: out["hours"] = 168
+            elif "month" in t: out["hours"] = 720
+            elif "today" in t: out["hours"] = 24
+            elif _re.search(r"last\s+hour|past\s+hour|this\s+hour", t):
+                out["hours"] = 1
+        # Show in a friendly unit
+        if out["hours"] >= 24 and out["hours"] % 24 == 0:
+            out["notes"].append(f"last {out['hours']//24}d")
+        else:
+            out["notes"].append(f"last {out['hours']}h")
+
+        m = _re.search(r"(?:severity|level)\s*(\d+)", t)
+        if m:
+            out["severity"] = int(m.group(1))
+        else:
+            if   "critical" in t: out["severity"] = 12
+            elif "high"     in t: out["severity"] = 10
+            elif "medium"   in t: out["severity"] = 7
+            elif _re.search(r"\blow\b|\ball\b|\beverything\b|\bany\b", t):
+                out["severity"] = 3
+        out["notes"].append(f"severity >= {out['severity']}")
 
     out["summary"] = "  |  ".join(out["notes"])
     return out
-
 
 # ── Investigation runner ──────────────────────────────────────────────────────
 def _run(prompt, severity, hours, agent, q, run_id=None):
@@ -150,6 +343,11 @@ def _run(prompt, severity, hours, agent, q, run_id=None):
 
     report = "".join(parts)
 
+    # If the analyst hit Stop, mark it stopped and discard the partial report
+    if ST.stop.is_set() or ag.STOP_FLAG.is_set():
+        status = "stopped"
+        report = "[Investigation stopped by user]"
+
     # Save to history
     if run_id:
         with ST.hist_lock:
@@ -178,7 +376,8 @@ def _run(prompt, severity, hours, agent, q, run_id=None):
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/parse", methods=["POST"])
 def parse_route():
-    return jsonify(parse_nl(request.get_json().get("text", "")))
+    result = parse_nl(request.get_json().get("text", ""))
+    return jsonify(result)
 
 
 @app.route("/stream")
@@ -282,6 +481,204 @@ def delete_report(run_id):
         except Exception as e:
             log.warning("History save after delete failed: %s", e)
     return jsonify({"ok": True})
+
+
+@app.route("/hunt_debug", methods=["GET"])
+def hunt_debug():
+    """Diagnostic: dump a real event so we can see actual field names + values."""
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    since = (_dt.now(_tz.utc) - _td(days=30)).isoformat()
+
+    out = {"since": since}
+
+    # 1. Grab one real event and show its full structure
+    try:
+        sample = ag.ix_search({"range":{"timestamp":{"gte":since}}}, size=3)
+        hits = sample.get("hits", [])
+        out["total_30d"] = sample.get("total", 0)
+        if hits:
+            # Show top-level keys and the rule sub-object
+            doc = hits[0]
+            out["top_level_keys"] = sorted(doc.keys())
+            out["rule_object"]    = doc.get("rule", "NO rule KEY")
+            out["has_full_log"]   = "full_log" in doc
+            out["full_log_sample"]= str(doc.get("full_log", "MISSING"))[:200]
+            # Show all 3 descriptions
+            out["sample_descriptions"] = [
+                h.get("rule", {}).get("description", "?") for h in hits
+            ]
+    except Exception as e:
+        out["sample_error"] = str(e)
+
+    # 2. Test a term that DEFINITELY exists (from the data: "Powershell")
+    term = (request.args.get("q") or "powershell").strip()
+    out["term"] = term
+    tests = {
+        "match_description":  {"match":{"rule.description":term}},
+        "match_desc_cap":     {"match":{"rule.description":term.capitalize()}},
+        "wildcard_desc_lc":   {"wildcard":{"rule.description":{"value":f"*{term.lower()}*"}}},
+        "wildcard_desc_kw":   {"wildcard":{"rule.description.keyword":{"value":f"*{term}*"}}},
+        "match_phrase_desc":  {"match_phrase":{"rule.description":term}},
+        "query_string_all":   {"query_string":{"query":term}},
+    }
+    out["counts"] = {}
+    for name, qclause in tests.items():
+        q = {"bool":{"must":[{"range":{"timestamp":{"gte":since}}}, qclause]}}
+        try:
+            r = ag.ix_agg(q, {"t":{"value_count":{"field":"rule.level"}}})
+            out["counts"][name] = r.get("t",{}).get("value",0)
+        except Exception as e:
+            out["counts"][name] = f"ERR: {str(e)[:80]}"
+
+    return jsonify(out)
+
+
+@app.route("/inventory", methods=["POST"])
+def inventory_route():
+    data  = request.get_json() or {}
+    kind  = (data.get("kind") or "").strip()
+    agent = (data.get("agent") or "").strip()
+    only_sus = bool(data.get("only_suspicious", False))
+    if not kind:
+        return jsonify({"error": "Missing inventory kind"}), 400
+    if not agent:
+        return jsonify({"error": "Inventory queries require an agent ID"}), 400
+    try:
+        return jsonify(ag.inventory(kind, agent, only_suspicious=only_sus))
+    except Exception as e:
+        log.exception("Inventory error")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/threat", methods=["POST"])
+def threat_route():
+    data     = request.get_json() or {}
+    category = (data.get("category") or "").strip()
+    hours    = int(data.get("hours", 24))
+    agent_id = (data.get("agent") or "").strip() or None
+    if not category:
+        return jsonify({"error": "Missing threat category"}), 400
+    try:
+        result = ag.threat_hunt(category, hours=hours, agent_id=agent_id)
+        # Save to history
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report = _threat_to_text(result, hours)
+        with ST.hist_lock:
+            ST.history[run_id] = {
+                "id": run_id, "label": f"THREAT: {result.get('label', category)}",
+                "started": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "ended":   datetime.now().strftime("%H:%M"),
+                "status":  "completed", "report": report,
+            }
+            ST._save_history()
+        result["run_id"] = run_id
+        return jsonify(result)
+    except Exception as e:
+        log.exception("Threat hunt error")
+        return jsonify({"error": str(e)}), 500
+
+
+def _threat_to_text(d, hours):
+    if d.get("error"):
+        return f"THREAT HUNT\nError: {d['error']}"
+    lines = [f"THREAT HUNT: {d.get('label','?')}",
+             f"Period: last {hours}h  |  Matches: {d.get('total',0)}"]
+    if d.get("max_sev"): lines.append(f"Max severity: {d['max_sev']}")
+    if d.get("tactics"): lines.append(f"MITRE tactics: {', '.join(d['tactics'])}")
+    lines.append("")
+    if d.get("total",0) == 0:
+        lines.append("No matching activity detected.")
+        return "\n".join(lines)
+    if d.get("by_agent"):
+        lines.append("AFFECTED AGENTS")
+        for b in d["by_agent"]:
+            nm = (b.get("name",{}).get("buckets",[{}]) or [{}])
+            nm = nm[0].get("key", b["key"]) if nm else b["key"]
+            lines.append(f"- {nm}: {b['doc_count']} events")
+        lines.append("")
+    if d.get("by_rule"):
+        lines.append("TOP MATCHED RULES")
+        for b in d["by_rule"]:
+            lines.append(f"- {b['key']}  ({b['doc_count']})")
+        lines.append("")
+    if d.get("samples"):
+        lines.append("HIGHEST-SEVERITY EVENTS")
+        for s in d["samples"][:10]:
+            ts = (s.get("timestamp","") or "")[:19].replace("T"," ")
+            ag_ = (s.get("agent",{}) or {}).get("name","?")
+            rd = (s.get("rule",{}) or {}).get("description","")
+            lv = (s.get("rule",{}) or {}).get("level","")
+            lines.append(f"- {ts}  {ag_}  [{lv}]  {rd}")
+    return "\n".join(lines)
+
+
+@app.route("/hunt", methods=["POST"])
+def hunt_route():
+    data      = request.get_json() or {}
+    query     = (data.get("query") or "").strip()
+    days      = int(data.get("days", 7))
+    agent_id  = (data.get("agent") or "").strip() or None
+    hunt_type = data.get("type", "auto")
+    if not query:
+        return jsonify({"error": "Empty query"}), 400
+    try:
+        result = ag.hunt(query, days=days, agent_id=agent_id, hunt_type=hunt_type)
+
+        # Save hunt to history as a text report
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report = _hunt_to_text(result, query, days)
+        with ST.hist_lock:
+            ST.history[run_id] = {
+                "id":      run_id,
+                "label":   f"HUNT: {query[:40]}",
+                "started": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "ended":   datetime.now().strftime("%H:%M"),
+                "status":  "completed",
+                "report":  report,
+            }
+            ST._save_history()
+        result["run_id"] = run_id
+        return jsonify(result)
+    except Exception as e:
+        log.exception("Hunt error")
+        return jsonify({"error": str(e)}), 500
+
+
+def _hunt_to_text(d, query, days):
+    """Render a hunt result as a plain-text report for history storage."""
+    if d.get("error"):
+        return f"HUNT: {query}\nError: {d['error']}"
+    total = d.get("total", 0)
+    lines = [f"HUNT: {query}",
+             f"Type: {d.get('hunt_type','?')}  |  Period: last {days} days",
+             f"Matches: {total}"]
+    if d.get("max_sev"):
+        lines.append(f"Max severity: {d['max_sev']}")
+    lines.append("")
+    if total == 0:
+        lines.append("No matches found.")
+        return "\n".join(lines)
+    if d.get("by_agent"):
+        lines.append("AFFECTED AGENTS")
+        for b in d["by_agent"]:
+            name = (b.get("name",{}).get("buckets",[{}]) or [{}])
+            name = name[0].get("key", b["key"]) if name else b["key"]
+            lines.append(f"- {name}: {b['doc_count']} events")
+        lines.append("")
+    if d.get("by_rule"):
+        lines.append("MATCHED RULES")
+        for b in d["by_rule"]:
+            lines.append(f"- {b['key']}  ({b['doc_count']})")
+        lines.append("")
+    if d.get("samples"):
+        lines.append("RECENT MATCHES")
+        for s in d["samples"][:10]:
+            ts    = (s.get("timestamp","") or "")[:19].replace("T"," ")
+            agent = (s.get("agent",{}) or {}).get("name","?")
+            rule  = (s.get("rule",{}) or {}).get("description","")
+            lvl   = (s.get("rule",{}) or {}).get("level","")
+            lines.append(f"- {ts}  {agent}  [{lvl}]  {rule}")
+    return "\n".join(lines)
 
 
 @app.route("/schedule", methods=["POST"])
@@ -390,7 +787,7 @@ def ask_context():
     the model from inventing connections that aren't there.
     """
     data     = request.get_json() or {}
-    question = data.get("question", "").strip()
+    question = (data.get("question") or "").strip()
     run_ids  = data.get("run_ids", [])   # specific reports to include, or empty = all
 
     if not question:
@@ -453,7 +850,7 @@ HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Wazuh Correlation Agent</title>
+<title>Correlation Agent</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -589,6 +986,13 @@ input:checked+.slider:before{transform:translateX(14px)}
   line-height:1.6}
 #ctx-src{font-size:10px;color:#484f58;margin-top:4px}
 
+.confirm-yes{padding:5px 16px;background:#238636;border:none;border-radius:5px;
+  color:#fff;font-size:12px;cursor:pointer;margin-right:8px}
+.confirm-yes:hover{background:#2ea043}
+.confirm-no{padding:5px 16px;background:#21262d;border:1px solid #30363d;
+  border-radius:5px;color:#8b949e;font-size:12px;cursor:pointer}
+.confirm-no:hover{color:#e6edf3}
+
 /* Rendered markdown styles */
 .md-body h1,.md-body h2,.md-body h3{color:#58a6ff;margin:10px 0 4px;font-size:13px;font-weight:700}
 .md-body p{margin:0 0 6px}
@@ -619,7 +1023,6 @@ if (typeof marked !== 'undefined') {
 <body>
 
 <header>
-  <h1>Wazuh Correlation Agent</h1>
   <span class="badge" id="model-badge">{{ model }}</span>
   <span class="badge" id="status-badge">idle</span>
   <div class="hdr-tabs">
@@ -629,6 +1032,7 @@ if (typeof marked !== 'undefined') {
     <div class="hdr-tab" id="tab-reports-btn" onclick="switchTab('reports')">
       Reports
     </div>
+
   </div>
 </header>
 
@@ -639,8 +1043,8 @@ if (typeof marked !== 'undefined') {
     <div class="controls">
       <div class="nl-wrap">
         <input id="nl-input" type="text" autocomplete="off" spellcheck="false"
-          placeholder="e.g. check agent 000 for high severity events last 24 hours — press Enter to parse">
-        <button class="nl-btn" onclick="parseNL()">Parse</button>
+          placeholder="check agent 001 last 2h  |  find 185.220.101.45  |  hunt pass the hash  |  show ports on agent 001"
+          onkeydown="if(event.key==='Enter')parseAndConfirm()">
       </div>
       <div id="nl-preview"></div>
       <div class="params">
@@ -672,11 +1076,11 @@ if (typeof marked !== 'undefined') {
           <input type="text" id="agent" placeholder="e.g. 000">
         </div>
         <div style="display:flex;gap:6px;align-items:flex-end">
-          <button class="btn-run" id="run-btn" onclick="startRun()">Run now</button>
+          <button class="btn-run" id="run-btn" onclick="parseAndConfirm()">Run now</button>
           <button class="btn-stop" id="stop-btn" onclick="stopRun()" disabled>Stop</button>
         </div>
       </div>
-      <p class="hint">Type a natural language request and press Enter, or fill the parameters manually.</p>
+      <p class="hint">Type what you want — e.g. "check agent 001 last 2h" or "find pass the hash attempts this week" — then press Enter or click Parse.</p>
     </div>
 
     <div class="sched-bar">
@@ -775,41 +1179,459 @@ function switchTab(name) {
 }
 
 // ── NL parser ─────────────────────────────────────────────────────────────────
-function parseNL() {
+function parseAndConfirm() {
   const text = document.getElementById('nl-input').value.trim();
-  if (!text) return;
+  // If no NL text, fall back to manual params from the form fields
+  if (!text) { startRun(); return; }
+
   fetch('/parse', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({text})})
-  .then(r => r.json()).then(d => {
+  .then(r => r.json())
+  .then(d => {
+    _pendingAction = d;   // store for confirmation
     const p = document.getElementById('nl-preview');
     p.style.display = 'block';
-    p.innerHTML = 'Understood: <strong>' + d.summary + '</strong>'
-      + '&nbsp;&nbsp;<button class="nl-btn" style="position:static;transform:none" '
-      + 'onclick="applyNL(' + d.severity + ',' + d.hours + ',\'' + d.agent + '\')">'
-      + 'Run this</button>'
-      + '&nbsp;<button class="nl-btn" style="position:static;transform:none;'
-      + 'background:#21262d;border:1px solid #30363d" '
-      + 'onclick="document.getElementById(\'nl-preview\').style.display=\'none\'">Edit</button>';
+    const isHunt   = d.intent === 'hunt_ioc' || d.intent === 'hunt_ttp';
+    const isInv    = d.intent === 'inventory';
+    const isThreat = d.intent === 'threat_category';
+    const label  = isThreat ? 'Threat Hunt' : isInv ? 'Inventory'
+                 : isHunt ? 'Hunt' : 'Investigate';
+    const color  = isThreat ? '#db6d28' : isInv ? '#a371f7'
+                 : isHunt ? '#1f6feb' : '#238636';
+    p.innerHTML =
+        '<div style="margin-bottom:8px">'
+      + '<strong style="color:' + color + '">' + label + '</strong>'
+      + '<span style="color:#8b949e"> — </span>'
+      + '<strong>' + esc(d.summary) + '</strong></div>'
+      + '<button class="confirm-yes" onclick="confirmRun()">Yes, run this</button>'
+      + '<button class="confirm-no" onclick="cancelConfirm()">Cancel</button>';
+  })
+  .catch(e => {
+    document.getElementById('nl-preview').style.display = 'block';
+    document.getElementById('nl-preview').innerHTML =
+      '<span style="color:#f85149">Parse failed: ' + e + '</span>';
   });
 }
-function applyNL(sev, hrs, agent) {
-  document.getElementById('severity').value = sev;
-  document.getElementById('hours').value    = hrs;
-  document.getElementById('agent').value    = agent;
+
+function cancelConfirm() {
+  _pendingAction = null;
   document.getElementById('nl-preview').style.display = 'none';
-  startRun();
+}
+
+function confirmRun() {
+  const d = _pendingAction;
+  document.getElementById('nl-preview').style.display = 'none';
+  if (!d) { startRun(); return; }
+  if (d.intent === 'threat_category') {
+    runThreatHunt(d.threat_cat, d.hours || 24, d.agent || '');
+  } else if (d.intent === 'inventory') {
+    runInventory(d.inv_kind, d.agent || '', d.only_suspicious || false);
+  } else if (d.intent === 'hunt_ioc' || d.intent === 'hunt_ttp') {
+    runHuntFromNL(d.query || '', d.days || 7, d.agent || '', d.hunt_type || 'auto');
+  } else {
+    document.getElementById('severity').value = d.severity;
+    document.getElementById('hours').value    = d.hours;
+    document.getElementById('agent').value    = d.agent;
+    startRun();
+  }
+}
+
+
+function runThreatHunt(category, hours, agent) {
+  _stoppable = false;
+  document.getElementById('nl-preview').style.display = 'none';
+  const out = document.getElementById('live-out');
+  out.classList.remove('md-body');
+  _liveBuffer = '';
+  document.getElementById('live-title').textContent = 'Threat Hunt';
+  document.getElementById('dot').className = 'live-dot running';
+  setRunning(true);
+  out.innerHTML = '<div style="color:#8b949e;font-size:12px;padding:8px 0">'
+    + 'Hunting for ' + esc(category) + ' indicators across last ' + hours + 'h...</div>';
+
+  fetch('/threat', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({category, hours, agent: agent||null})
+  })
+  .then(r => r.json())
+  .then(d => {
+    document.getElementById('dot').className = 'live-dot';
+    setRunning(false);
+    if (d.error) {
+      out.innerHTML = '<div style="color:#f85149">Error: ' + esc(d.error) + '</div>';
+      return;
+    }
+    _liveBuffer = _formatThreat(d);
+    out.innerHTML = _liveBuffer;
+    _loadHistoryData();
+  })
+  .catch(e => {
+    setRunning(false);
+    document.getElementById('dot').className = 'live-dot error';
+    out.innerHTML = '<div style="color:#f85149">Request failed: ' + e + '</div>';
+  });
+}
+
+function _formatThreat(d) {
+  const total = d.total || 0;
+  const sevColor = (d.max_sev >= 13) ? '#f85149' : (d.max_sev >= 10) ? '#f0883e' : '#3fb950';
+  let html = '';
+
+  // Title
+  html += '<div style="font-size:15px;font-weight:600;color:#db6d28;margin-bottom:4px">'
+        + esc(d.label) + '</div>';
+
+  if (total === 0) {
+    html += '<div style="color:#3fb950;font-size:13px;padding:10px 0">'
+          + '✓ No ' + esc(d.label.toLowerCase()) + ' activity detected in the last '
+          + d.hours + ' hours.</div>';
+    return html;
+  }
+
+  // Summary strip
+  html += '<div style="display:flex;gap:20px;flex-wrap:wrap;padding:10px 0 14px;'
+        + 'border-bottom:1px solid #21262d;margin-bottom:14px">';
+  const stats = [
+    ['Events', String(total), sevColor],
+    ['Max severity', d.max_sev ? String(d.max_sev) : '—', sevColor],
+    ['Agents', String((d.by_agent||[]).length), '#e6edf3'],
+    ['Period', 'last ' + d.hours + 'h', '#8b949e'],
+  ];
+  stats.forEach(([l,v,col]) => {
+    html += '<div><div style="font-size:10px;color:#484f58;text-transform:uppercase">'
+          + l + '</div><div style="font-size:14px;font-weight:600;color:' + col + '">'
+          + esc(v) + '</div></div>';
+  });
+  html += '</div>';
+
+  if (d.tactics && d.tactics.length) {
+    html += '<div style="font-size:11px;color:#8b949e;margin-bottom:12px">'
+          + 'MITRE tactics: <span style="color:#db6d28">' + d.tactics.join(', ')
+          + '</span></div>';
+  }
+
+  // Affected agents
+  if (d.by_agent && d.by_agent.length) {
+    html += _huntSection('Affected agents');
+    d.by_agent.forEach(b => {
+      const nm = (b.name && b.name.buckets && b.name.buckets[0]) ? b.name.buckets[0].key : b.key;
+      html += '<div style="display:flex;gap:10px;padding:4px 0;border-bottom:1px solid #161b22;font-size:12px">'
+            + '<span style="color:#58a6ff;width:130px">' + esc(nm) + '</span>'
+            + '<span style="color:#e6edf3;font-weight:600">' + b.doc_count + ' events</span></div>';
+    });
+  }
+
+  // Top rules
+  if (d.by_rule && d.by_rule.length) {
+    html += _huntSection('Top matched rules');
+    d.by_rule.forEach(b => {
+      html += '<div style="display:flex;justify-content:space-between;padding:3px 0;'
+            + 'border-bottom:1px solid #161b22;font-size:12px">'
+            + '<span style="color:#8b949e">' + esc(b.key) + '</span>'
+            + '<span style="color:#e6edf3;font-weight:600">' + b.doc_count + '</span></div>';
+    });
+  }
+
+  // Highest-severity sample events
+  if (d.samples && d.samples.length) {
+    html += _huntSection('Highest-severity events');
+    d.samples.forEach(s => {
+      const ts = (s.timestamp||'').slice(0,19).replace('T',' ');
+      const agent = (s.agent||{}).name || (s.agent||{}).id || '?';
+      const rule = (s.rule||{}).description || '';
+      const lvl = (s.rule||{}).level || '';
+      const lc = (lvl>=13)?'#f85149':(lvl>=10)?'#f0883e':'#8b949e';
+      html += '<div style="background:#161b22;border:1px solid #21262d;border-radius:4px;'
+            + 'padding:8px 10px;margin-bottom:6px;font-size:11px;font-family:monospace">'
+            + '<div style="color:#8b949e;margin-bottom:3px">' + esc(ts)
+            + '&nbsp;&nbsp;<span style="color:#58a6ff">' + esc(agent) + '</span>'
+            + '&nbsp;&nbsp;<span style="color:' + lc + '">[' + lvl + ']</span></div>'
+            + '<div style="color:#e6edf3">' + esc(rule) + '</div></div>';
+    });
+  }
+  return html;
+}
+
+function runInventory(kind, agent, onlySuspicious) {
+  _stoppable = false;
+  document.getElementById('nl-preview').style.display = 'none';
+  if (!agent) {
+    const out = document.getElementById('live-out');
+    out.classList.remove('md-body');
+    out.innerHTML = '<div style="color:#f85149;padding:8px 0">'
+      + 'Inventory queries need an agent ID. Try "show ports on agent 001".</div>';
+    return;
+  }
+  const out = document.getElementById('live-out');
+  out.classList.remove('md-body');
+  _liveBuffer = '';
+  document.getElementById('live-title').textContent =
+    kind.charAt(0).toUpperCase() + kind.slice(1) + ' — agent ' + agent;
+  document.getElementById('dot').className = 'live-dot running';
+  setRunning(true);
+  out.innerHTML = '<div style="color:#8b949e;font-size:12px;padding:8px 0">'
+    + 'Querying ' + kind + ' on agent ' + esc(agent) + '...</div>';
+
+  fetch('/inventory', {
+    method:  'POST',
+    headers: {'Content-Type':'application/json'},
+    body:    JSON.stringify({kind, agent, only_suspicious: onlySuspicious || false})
+  })
+  .then(r => r.json())
+  .then(d => {
+    document.getElementById('dot').className = 'live-dot';
+    setRunning(false);
+    if (d.error) {
+      out.innerHTML = '<div style="color:#f85149">Error: ' + esc(d.error) + '</div>';
+      return;
+    }
+    _liveBuffer = _formatInventory(d);
+    out.innerHTML = _liveBuffer;
+  })
+  .catch(e => {
+    setRunning(false);
+    document.getElementById('dot').className = 'live-dot error';
+    out.innerHTML = '<div style="color:#f85149">Request failed: ' + e + '</div>';
+  });
+}
+
+function _formatInventory(d) {
+  let html = '';
+  // Summary strip
+  html += '<div style="display:flex;gap:20px;padding:10px 0 14px;'
+        + 'border-bottom:1px solid #21262d;margin-bottom:14px">';
+  html += '<div><div style="font-size:10px;color:#484f58;text-transform:uppercase">Type</div>'
+        + '<div style="font-size:14px;font-weight:600;color:#a371f7">' + esc(d.kind) + '</div></div>';
+  html += '<div><div style="font-size:10px;color:#484f58;text-transform:uppercase">Agent</div>'
+        + '<div style="font-size:14px;font-weight:600;color:#58a6ff">' + esc(d.agent) + '</div></div>';
+  html += '<div><div style="font-size:10px;color:#484f58;text-transform:uppercase">Total</div>'
+        + '<div style="font-size:14px;font-weight:600;color:#e6edf3">' + d.count + '</div></div>';
+  html += '</div>';
+
+  // Flagged items first
+  if (d.flags && d.flags.length) {
+    html += '<div style="font-size:10px;font-weight:600;color:#f85149;text-transform:uppercase;'
+          + 'letter-spacing:.5px;margin-bottom:6px">⚠ Flagged (' + d.flags.length + ')</div>';
+    d.flags.forEach(f => {
+      html += '<div style="background:#2d1416;border:1px solid #f8514944;border-radius:4px;'
+            + 'padding:6px 10px;margin-bottom:4px;font-size:12px;color:#ffa198;'
+            + 'font-family:monospace">' + esc(f) + '</div>';
+    });
+    html += '<div style="height:12px"></div>';
+  }
+
+  // Build table by kind
+  const rows = d.rows || [];
+  if (!rows.length) {
+    if (d.only_suspicious) {
+      html += '<div style="color:#3fb950;font-size:13px;padding:10px 0">'
+            + '✓ No suspicious ' + esc(d.kind) + ' found on agent ' + esc(d.agent)
+            + '. Nothing matched the known-bad indicators.</div>';
+    } else {
+      html += '<div style="color:#484f58;font-size:12px">No data returned. '
+            + 'Agent may be offline or have no ' + esc(d.kind) + ' inventory.</div>';
+    }
+    return html;
+  }
+  // Banner when showing suspicious-only results
+  if (d.only_suspicious) {
+    html = '<div style="color:#f0883e;font-size:12px;padding:6px 0 10px">'
+         + '⚠ Showing only suspicious ' + esc(d.kind) + ' ('
+         + rows.length + ' flagged)</div>' + html;
+  }
+
+  let cols = [];
+  if (d.kind === 'ports')     cols = [['port','Port',60],['protocol','Proto',60],['state','State',110],['process','Process',200]];
+  if (d.kind === 'processes') cols = [['name','Process',160],['pid','PID',60],['ppid','PPID',60],['cmd','Command',300]];
+  if (d.kind === 'packages')  cols = [['name','Package',220],['version','Version',120],['vendor','Vendor',220]];
+  if (d.kind === 'files')     cols = [['file','File',360],['mtime','Modified',150],['hash','Hash',140]];
+
+  html += '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">';
+  html += '<tr style="border-bottom:1px solid #30363d">';
+  cols.forEach(([k,label,w]) => {
+    html += '<th style="text-align:left;padding:5px 8px;color:#58a6ff;width:' + w + 'px">' + label + '</th>';
+  });
+  html += '</tr>';
+  rows.forEach(r => {
+    const rowBg = r._sus ? 'background:#2d1416;' : '';
+    const txtCol = r._sus ? '#ffa198' : '#c9d1d9';
+    html += '<tr style="border-bottom:1px solid #161b22;' + rowBg + '">';
+    cols.forEach(([k]) => {
+      html += '<td style="padding:4px 8px;color:' + txtCol + ';word-break:break-all">'
+            + esc(String(r[k] != null ? r[k] : '')) + '</td>';
+    });
+    html += '</tr>';
+  });
+  html += '</table>';
+  if (rows.length >= 100) {
+    html += '<div style="color:#484f58;font-size:11px;margin-top:8px">'
+          + 'Showing first 100 of ' + d.count + ' — refine with a hunt query for specifics.</div>';
+  }
+  return html;
+}
+
+function runHuntFromNL(query, days, agent, huntType) {
+  _stoppable = false;
+  document.getElementById('nl-preview').style.display = 'none';
+  const out = document.getElementById('live-out');
+  out.classList.remove('md-body');
+  out.innerHTML = '';
+  _liveBuffer   = '';
+  document.getElementById('live-title').textContent = 'Hunt — ' + query;
+  document.getElementById('dot').className = 'live-dot running';
+  setRunning(true);
+  _t0    = Date.now();
+  _timer = setInterval(() => {
+    const s = Math.floor((Date.now()-_t0)/1000);
+    document.getElementById('elapsed').textContent = s + 's';
+  }, 1000);
+
+  out.innerHTML = '<div style="color:#8b949e;font-size:12px;padding:8px 0">'
+    + 'Hunting for <strong style="color:#e6edf3">' + esc(query) + '</strong>'
+    + ' across last ' + days + ' days...</div>';
+
+  fetch('/hunt', {
+    method:  'POST',
+    headers: {'Content-Type':'application/json'},
+    body:    JSON.stringify({query, days, agent: agent||null, type: huntType})
+  })
+  .then(r => r.json())
+  .then(d => {
+    clearInterval(_timer);
+    document.getElementById('elapsed').textContent = '';
+    document.getElementById('dot').className = 'live-dot';
+    setRunning(false);
+    if (d.error) {
+      out.innerHTML = '<div style="color:#f85149">Error: ' + esc(d.error) + '</div>';
+      return;
+    }
+    _liveBuffer = _formatHuntResults(d);
+    out.innerHTML = _liveBuffer;
+    _loadHistoryData();
+  })
+  .catch(e => {
+    clearInterval(_timer);
+    setRunning(false);
+    document.getElementById('dot').className = 'live-dot error';
+    out.innerHTML = '<div style="color:#f85149">Request failed: ' + e + '</div>';
+  });
+}
+
+function _formatHuntResults(d) {
+  const total = d.total || 0;
+  if (total === 0) {
+    return '<div style="color:#484f58;font-size:12px;padding:12px 0">'
+      + 'No matches found for <strong style="color:#8b949e">'
+      + esc(d.value || d.ttp_name || '') + '</strong> in the last '
+      + d.days + ' days.<br>'
+      + 'Either the indicator is not present or events have been rotated out of the index.'
+      + '</div>';
+  }
+
+  const sevColor = (d.max_sev >= 13) ? '#f85149' : (d.max_sev >= 10) ? '#f0883e' : '#3fb950';
+  let html = '';
+
+  // ── Summary strip ─────────────────────────────────────────────────────────
+  html += '<div style="display:flex;gap:20px;flex-wrap:wrap;padding:10px 0 14px;'
+        + 'border-bottom:1px solid #21262d;margin-bottom:14px">';
+  const stats = [
+    ['Matches',      String(total),               total > 0 ? sevColor : '#8b949e'],
+    ['Type',         d.hunt_type || d.intent,      '#8b949e'],
+    ['Indicator',    d.value || d.ttp_name || '',  '#e6edf3'],
+    ['Max severity', d.max_sev ? String(d.max_sev) : '—', sevColor],
+    ['Period',       'last ' + d.days + ' days',  '#8b949e'],
+  ];
+  stats.forEach(([label, val, col]) => {
+    if (!val || val === 'undefined') return;
+    html += '<div><div style="font-size:10px;color:#484f58;text-transform:uppercase'
+          + ';letter-spacing:.5px">' + label + '</div>'
+          + '<div style="font-size:14px;font-weight:600;color:' + col + '">'
+          + esc(val) + '</div></div>';
+  });
+  html += '</div>';
+
+  // ── Affected agents ───────────────────────────────────────────────────────
+  if (d.by_agent && d.by_agent.length) {
+    html += _huntSection('Affected agents (' + d.by_agent.length + ')');
+    d.by_agent.forEach(b => {
+      const name  = (b.name && b.name.buckets && b.name.buckets[0])
+                    ? b.name.buckets[0].key : b.key;
+      const first = b.first ? (b.first.value_as_string || '').slice(0,10) : '';
+      const last  = b.last  ? (b.last.value_as_string  || '').slice(0,10) : '';
+      const range = first ? (first + (last && last !== first ? ' → ' + last : '')) : '';
+      html += '<div style="display:flex;align-items:center;gap:10px;padding:5px 0;'
+            + 'border-bottom:1px solid #161b22;font-size:12px">'
+            + '<span style="color:#58a6ff;width:120px;flex-shrink:0">' + esc(name) + '</span>'
+            + '<span style="color:#e6edf3;font-weight:600;width:35px">' + b.doc_count + '</span>'
+            + '<span style="color:#484f58">' + esc(range) + '</span>'
+            + '</div>';
+    });
+  }
+
+  // ── Matched rules (TTP hunts) ─────────────────────────────────────────────
+  if (d.by_rule && d.by_rule.length) {
+    html += _huntSection('Matched rules');
+    d.by_rule.forEach(b => {
+      html += '<div style="display:flex;justify-content:space-between;padding:3px 0;'
+            + 'border-bottom:1px solid #161b22;font-size:12px">'
+            + '<span style="color:#8b949e">' + esc(b.key) + '</span>'
+            + '<span style="color:#e6edf3;font-weight:600">' + b.doc_count + '</span>'
+            + '</div>';
+    });
+  }
+
+  // ── MITRE tactics ─────────────────────────────────────────────────────────
+  if (d.by_tactic && d.by_tactic.length) {
+    html += _huntSection('MITRE tactics observed');
+    d.by_tactic.forEach(b => {
+      html += '<div style="display:flex;justify-content:space-between;padding:3px 0;'
+            + 'border-bottom:1px solid #161b22;font-size:12px">'
+            + '<span style="color:#8b949e">' + esc(b.key) + '</span>'
+            + '<span style="color:#e6edf3;font-weight:600">' + b.doc_count + '</span>'
+            + '</div>';
+    });
+  }
+
+  // ── Sample events ─────────────────────────────────────────────────────────
+  if (d.samples && d.samples.length) {
+    html += _huntSection('Most recent matches');
+    d.samples.forEach(src => {
+      const ts    = (src.timestamp || '').slice(0,19).replace('T',' ');
+      const agent = (src.agent || {}).name || (src.agent || {}).id || '?';
+      const rule  = (src.rule  || {}).description || '';
+      const level = (src.rule  || {}).level || '';
+      const log_  = (src.full_log || '').slice(0, 200);
+      html += '<div style="background:#161b22;border:1px solid #21262d;border-radius:4px;'
+            + 'padding:8px 10px;margin-bottom:6px;font-size:11px;font-family:monospace">'
+            + '<div style="color:#8b949e;margin-bottom:3px">' + esc(ts)
+            + '&nbsp;&nbsp;<span style="color:#58a6ff">' + esc(agent) + '</span>'
+            + '&nbsp;&nbsp;[' + level + ']</div>'
+            + '<div style="color:#e6edf3">' + esc(rule) + '</div>'
+            + (log_ ? '<div style="color:#484f58;margin-top:3px;word-break:break-all">'
+               + esc(log_) + '</div>' : '')
+            + '</div>';
+    });
+  }
+  return html;
+}
+
+function _huntSection(title) {
+  return '<div style="font-size:10px;font-weight:600;color:#8b949e;text-transform:uppercase;'
+       + 'letter-spacing:.5px;margin:14px 0 6px;border-bottom:1px solid #21262d;padding-bottom:4px">'
+       + title + '</div>';
 }
 document.getElementById('nl-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') parseNL();
+  if (e.key === 'Enter') parseAndConfirm();
 });
 
 // ── Run control ───────────────────────────────────────────────────────────────
-let _es=null, _running=false, _t0=0, _timer=null, _liveBuffer='';
+let _es=null, _running=false, _t0=0, _timer=null, _liveBuffer='', _pendingAction=null, _stoppable=false;
 
 function setRunning(on) {
   _running = on;
   document.getElementById('run-btn').disabled  = on;
-  document.getElementById('stop-btn').disabled = !on;
+  // Stop button only active for stoppable runs (investigations), not hunts/inventory
+  document.getElementById('stop-btn').disabled = !(on && _stoppable);
   document.getElementById('dot').className = 'live-dot' + (on ? ' running' : '');
   document.getElementById('status-badge').textContent = on ? 'running' : 'idle';
   document.getElementById('status-text').textContent  = on ? 'running...' : 'idle';
@@ -821,6 +1643,7 @@ function setRunning(on) {
 
 function startRun() {
   if (_running) return;
+  _stoppable = true;
   const sev   = document.getElementById('severity').value;
   const hours = document.getElementById('hours').value;
   const agent = document.getElementById('agent').value.trim();
@@ -853,7 +1676,19 @@ function startRun() {
 
 function stopRun() {
   fetch('/stop', {method: 'POST'});
-  finish(false);
+  if (_es) { _es.close(); _es = null; }
+  clearInterval(_timer);
+  setRunning(false);
+  document.getElementById('elapsed').textContent = '';
+  document.getElementById('live-title').textContent = 'Output — stopped';
+  document.getElementById('dot').className = 'live-dot';
+  const out = document.getElementById('live-out');
+  const note = document.createElement('div');
+  note.style.cssText = 'color:#f0883e;font-size:12px;margin-top:8px';
+  note.textContent = '■ Stopped by user. (Model inference already in progress '
+    + 'may finish in the background but its result is discarded.)';
+  out.appendChild(note);
+  _loadHistoryData();
 }
 
 function finish(err) {
