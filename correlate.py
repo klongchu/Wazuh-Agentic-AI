@@ -778,6 +778,475 @@ def call_llm(alert, evidence, chain):
     log.info("Report done: %d chars, risk=%s", len(report), risk)
     return report
 
+
+
+# ── Inventory (syscollector snapshot) ─────────────────────────────────────────
+# Read-only host inventory queries — no LLM, fast, factual.
+# Optionally flags suspicious findings (odd ports, hacking tools).
+
+_SUSPECT_PORTS = {4444:"Metasploit default", 1337:"common backdoor",
+                  31337:"Back Orifice", 12345:"NetBus", 5555:"ADB/remote",
+                  6666:"IRC botnet", 6667:"IRC botnet", 8080:"proxy/alt-http"}
+
+# Suspect tool names. Matched as whole words (regex \b boundaries) so that
+# legitimate processes like "mDNSResponder" don't false-positive on "responder".
+_SUSPECT_PKG = ["nmap","netcat","ncat","mimikatz","metasploit","sqlmap",
+                "hydra","wireshark","tcpdump","psexec",
+                "powersploit","cobaltstrike","bloodhound","impacket",
+                "sharphound","rubeus","kerbrute","crackmapexec","secretsdump",
+                "winpeas","linpeas","seatbelt","certify"]
+
+import re as _re_susp
+# Pre-compile word-boundary patterns. "responder" alone is too broad
+# (matches mDNSResponder) so it is intentionally excluded — use a more
+# specific indicator if hunting for the Responder tool.
+_SUSPECT_RE = _re_susp.compile(
+    r"\b(" + "|".join(_re_susp.escape(s) for s in _SUSPECT_PKG) + r")\b",
+    _re_susp.IGNORECASE)
+
+def _is_suspect(text):
+    """Whole-word match against the suspect tool list."""
+    return bool(_SUSPECT_RE.search(text or ""))
+
+def inventory(kind, agent_id, only_suspicious=False):
+    """
+    kind: "packages" | "ports" | "processes" | "files"
+    only_suspicious: if True, return ONLY flagged/suspicious items.
+    Returns a structured dict with the raw data and any flagged items.
+    """
+    if not agent_id:
+        return {"error": "Inventory queries require an agent ID"}
+
+    aid = agent_id.zfill(3)
+
+    try:
+        if kind == "ports":
+            r     = wget(f"/syscollector/{aid}/ports", {"limit": 200})
+            items = r.get("affected_items", [])
+            rows, flags = [], []
+            for p in items:
+                port  = p.get("local", {}).get("port")
+                proto = p.get("protocol", "")
+                state = p.get("state", "")
+                proc  = p.get("process", "?")
+                sus   = port in _SUSPECT_PORTS
+                rows.append({"port": port, "protocol": proto,
+                             "state": state, "process": proc, "_sus": sus})
+                if sus:
+                    flags.append(f"Port {port} ({_SUSPECT_PORTS[port]}) — {proc}")
+            if only_suspicious:
+                rows = [r for r in rows if r.get("_sus")]
+            return {"kind": "ports", "agent": aid, "count": len(rows),
+                    "rows": rows, "flags": flags,
+                    "only_suspicious": only_suspicious}
+
+        elif kind == "processes":
+            r     = wget(f"/syscollector/{aid}/processes", {"limit": 300})
+            items = r.get("affected_items", [])
+            rows, flags = [], []
+            for p in items:
+                name = p.get("name", "")
+                pid  = p.get("pid", "")
+                ppid = p.get("ppid", "")
+                cmd  = p.get("cmd", "") or p.get("command", "")
+                low  = (name + " " + cmd).lower()
+                sus  = _is_suspect(low)
+                rows.append({"name": name, "pid": pid, "ppid": ppid,
+                             "cmd": cmd[:120], "_sus": sus})
+                if sus:
+                    flags.append(f"{name} (PID {pid}) — {cmd[:80]}")
+            if only_suspicious:
+                rows = [r for r in rows if r.get("_sus")]
+            else:
+                rows = rows[:100]
+            return {"kind": "processes", "agent": aid, "count": len(rows),
+                    "rows": rows, "flags": flags,
+                    "only_suspicious": only_suspicious}
+
+        elif kind == "packages":
+            r     = wget(f"/syscollector/{aid}/packages", {"limit": 500})
+            items = r.get("affected_items", [])
+            rows, flags = [], []
+            for p in items:
+                name    = p.get("name", "")
+                version = p.get("version", "")
+                vendor  = p.get("vendor", "")
+                sus     = _is_suspect(name)
+                rows.append({"name": name, "version": version,
+                             "vendor": vendor, "_sus": sus})
+                if sus:
+                    flags.append(f"{name} {version} ({vendor})")
+            if only_suspicious:
+                rows = [r for r in rows if r.get("_sus")]
+            return {"kind": "packages", "agent": aid, "count": len(rows),
+                    "rows": rows, "flags": flags,
+                    "only_suspicious": only_suspicious}
+
+        elif kind == "files":
+            r     = wget(f"/syscheck/{aid}", {"limit": 200})
+            items = r.get("affected_items", [])
+            rows, flags = [], []
+            SUSP_PATH = ["/tmp", "/dev/shm", "appdata", "\\temp",
+                         "system32", "\\run", "startup"]
+            for f in items:
+                path  = f.get("file", "")
+                mtime = f.get("mtime", "") or f.get("date", "")
+                sha   = f.get("sha256", "") or f.get("sha1", "")
+                sus   = any(s in path.lower() for s in SUSP_PATH)
+                rows.append({"file": path, "mtime": str(mtime)[:19],
+                             "hash": sha[:16], "_sus": sus})
+                if sus:
+                    flags.append(f"{path}  (modified {str(mtime)[:19]})")
+            if only_suspicious:
+                rows = [r for r in rows if r.get("_sus")]
+            else:
+                rows = rows[:100]
+            return {"kind": "files", "agent": aid, "count": len(rows),
+                    "rows": rows, "flags": flags,
+                    "only_suspicious": only_suspicious}
+
+        else:
+            return {"error": f"Unknown inventory kind: {kind}"}
+
+    except Exception as e:
+        return {"error": str(e), "kind": kind, "agent": aid}
+
+
+# ── Threat Hunt ───────────────────────────────────────────────────────────────
+
+# Known IOC patterns
+import re as _re_hunt
+_IP_RE   = _re_hunt.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+_HASH_RE = _re_hunt.compile(r"^[0-9a-fA-F]{32,64}$")
+_CVE_RE  = _re_hunt.compile(r"CVE-\d{4}-\d+", _re_hunt.IGNORECASE)
+
+# TTP keyword → OpenSearch field mapping
+TTP_MAP = {
+    # Pass-the-hash / credential access
+    "pass the hash":       [{"wildcard":{"rule.description":{"value":"*pass-the-hash*","case_insensitive":True}}},
+                            {"match":{"rule.groups":"authentication_failed"}}],
+    "pth":                 [{"wildcard":{"rule.description":{"value":"*pass-the-hash*","case_insensitive":True}}}],
+    "credential dump":     [{"wildcard":{"rule.description":{"value":"*credential*","case_insensitive":True}}},
+                            {"wildcard":{"data.win.eventdata.image":{"value":"*lsass*","case_insensitive":True}}}],
+    "mimikatz":            [{"wildcard":{"data.win.eventdata.image":{"value":"*mimikatz*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*mimikatz*","case_insensitive":True}}}],
+    # Lateral movement
+    "lateral movement":    [{"match":{"rule.groups":"impacket"}},
+                            {"wildcard":{"rule.description":{"value":"*lateral*","case_insensitive":True}}}],
+    "psexec":              [{"wildcard":{"data.win.eventdata.image":{"value":"*psexec*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*psexec*","case_insensitive":True}}}],
+    "wmi":                 [{"wildcard":{"data.win.eventdata.image":{"value":"*wmiprvse*","case_insensitive":True}}},
+                            {"match":{"rule.groups":"impacket"}}],
+    # Persistence
+    "scheduled task":      [{"wildcard":{"rule.description":{"value":"*scheduled task*","case_insensitive":True}}},
+                            {"match":{"data.win.system.eventID":"4698"}}],
+    "registry persistence":[{"wildcard":{"rule.description":{"value":"*registry*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*persistence*","case_insensitive":True}}}],
+    "new service":         [{"match":{"data.win.system.eventID":"4697"}},
+                            {"wildcard":{"rule.description":{"value":"*new service*","case_insensitive":True}}}],
+    # Defense evasion
+    "process injection":   [{"wildcard":{"rule.description":{"value":"*process injection*","case_insensitive":True}}},
+                            {"match":{"rule.groups":"sysmon_eid10_detections"}}],
+    "powershell":          [{"wildcard":{"data.win.eventdata.image":{"value":"*powershell*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*powershell*","case_insensitive":True}}}],
+    # Discovery
+    "port scan":           [{"wildcard":{"rule.description":{"value":"*port scan*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*nmap*","case_insensitive":True}}}],
+    "reconnaissance":      [{"wildcard":{"rule.description":{"value":"*recon*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*enumeration*","case_insensitive":True}}}],
+    # Execution
+    "script drop":         [{"wildcard":{"rule.description":{"value":"*script*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*dropped*","case_insensitive":True}}}],
+    "malware":             [{"wildcard":{"rule.description":{"value":"*malware*","case_insensitive":True}}},
+                            {"wildcard":{"rule.description":{"value":"*trojan*","case_insensitive":True}}}],
+}
+
+def _hunt_ioc(value, days, agent_id=None):
+    """Search for an IP, hash, domain, or CVE.
+    Uses wildcard (case-insensitive) since description/full_log are keyword fields."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    must  = [{"range":{"timestamp":{"gte":since}}}]
+    if agent_id:
+        must.append({"term":{"agent.id": agent_id}})
+
+    if _IP_RE.match(value):    hunt_type = "IP Address"
+    elif _HASH_RE.match(value): hunt_type = "File Hash"
+    elif _CVE_RE.match(value):  hunt_type = "CVE"
+    else:                       hunt_type = "Indicator"
+
+    v = value.lower()
+    should = [
+        {"wildcard": {"full_log":         {"value": f"*{v}*", "case_insensitive": True}}},
+        {"wildcard": {"rule.description": {"value": f"*{v}*", "case_insensitive": True}}},
+        {"match":    {"data.srcip": value}},
+        {"match":    {"data.dstip": value}},
+    ]
+    q = {"bool": {"must": must, "should": should, "minimum_should_match": 1}}
+
+    log.info("HUNT IOC value=%r type=%s days=%d", value, hunt_type, days)
+
+    aggs = {
+        "by_agent": {"terms": {"field": "agent.id", "size": 20},
+                     "aggs":  {"name":  {"terms": {"field": "agent.name", "size": 1}},
+                               "first": {"min":   {"field": "timestamp"}},
+                               "last":  {"max":   {"field": "timestamp"}}}},
+        "total":    {"value_count": {"field": "rule.level"}},
+    }
+    agg_result = ix_agg(q, aggs)
+    hits       = ix_search(q, size=10, sort=[{"timestamp": {"order": "desc"}}])
+    total = agg_result.get("total", {}).get("value", 0)
+    log.info("HUNT IOC result: total=%d", total)
+
+    return {
+        "hunt_type": hunt_type,
+        "value":     value,
+        "days":      days,
+        "total":     total,
+        "by_agent":  agg_result.get("by_agent", {}).get("buckets", []),
+        "samples":   hits.get("hits", []),
+    }
+
+
+def _hunt_ttp(query, days, agent_id=None):
+    """Search for a TTP by keyword.
+    NOTE: rule.description is a KEYWORD field in this index, so `match`
+    does not work — only `wildcard` (lowercase) matches. Confirmed via diagnostics.
+    """
+    since  = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    must   = [{"range": {"timestamp": {"gte": since}}}]
+    if agent_id:
+        must.append({"term": {"agent.id": agent_id}})
+
+    q_lower  = query.lower().strip()
+    ttp_name = query
+
+    # rule.description is a KEYWORD field, so we use case_insensitive wildcard.
+    # For multi-word queries, match each word independently (AND) so word order
+    # and filler words between them do not break the match.
+    # "cis benchmark" matches "CIS Benchmark for Amazon Linux..." correctly.
+    words = [w for w in q_lower.split() if len(w) > 1]
+
+    if len(words) > 1:
+        # Each word must appear somewhere in the description (AND of wildcards)
+        desc_must = [{"wildcard": {"rule.description":
+                      {"value": f"*{w}*", "case_insensitive": True}}} for w in words]
+        log_must  = [{"wildcard": {"full_log":
+                      {"value": f"*{w}*", "case_insensitive": True}}} for w in words]
+        should = [
+            {"bool": {"must": desc_must}},   # all words in description
+            {"bool": {"must": log_must}},    # all words in full_log
+            {"match": {"rule.groups": q_lower}},
+        ]
+    else:
+        # Single word — simple wildcard
+        should = [
+            {"wildcard": {"rule.description": {"value": f"*{q_lower}*",
+                                               "case_insensitive": True}}},
+            {"wildcard": {"full_log":         {"value": f"*{q_lower}*",
+                                               "case_insensitive": True}}},
+            {"match":    {"rule.groups": q_lower}},
+        ]
+
+    # Add known-TTP specific group/field clauses if mapped
+    for key, clauses in TTP_MAP.items():
+        if key in q_lower or q_lower in key:
+            should.extend(clauses)
+            ttp_name = key
+            break
+
+    q = {"bool": {"must": must, "should": should, "minimum_should_match": 1}}
+
+    log.info("HUNT TTP query=%r days=%d agent=%s", query, days, agent_id)
+
+    aggs = {
+        "by_agent": {"terms": {"field": "agent.id", "size": 20},
+                     "aggs":  {"name": {"terms": {"field": "agent.name", "size": 1}}}},
+        "by_rule":  {"terms": {"field": "rule.description", "size": 10}},
+        "total":    {"value_count": {"field": "rule.level"}},
+        "severity": {"max":         {"field": "rule.level"}},
+    }
+    agg_result = ix_agg(q, aggs)
+
+    hits  = ix_search(q, size=10, sort=[{"timestamp": {"order": "desc"}}])
+    total = agg_result.get("total", {}).get("value", 0)
+    log.info("HUNT TTP result: total=%d", total)
+
+    return {
+        "hunt_type": "TTP",
+        "ttp_name":  ttp_name,
+        "value":     query,
+        "days":      days,
+        "total":     total,
+        "max_sev":   agg_result.get("severity", {}).get("value", 0),
+        "by_agent":  agg_result.get("by_agent", {}).get("buckets", []),
+        "by_rule":   agg_result.get("by_rule",  {}).get("buckets", []),
+        "by_tactic": [],
+        "samples":   hits.get("hits", []),
+    }
+
+
+
+# ── Threat Category Hunt ──────────────────────────────────────────────────────
+# Maps high-level analyst questions to bundles of detection patterns.
+# Each category searches rule.description (keyword field → wildcards) and
+# rule.groups for indicators of that whole class of attack.
+
+THREAT_CATEGORIES = {
+    "exfiltration": {
+        "label": "Data Exfiltration",
+        "desc_terms": ["exfiltrat", "data transfer", "large outbound",
+                       "dns tunnel", "upload", "compress", "archive created",
+                       "rar", "7z", "zip", "ftp", "scp", "data staged"],
+        "groups": ["sysmon_eid3_detections"],
+        "tactics": ["Exfiltration", "Collection", "Command and Control"],
+    },
+    "rce": {
+        "label": "Remote Code Execution",
+        "desc_terms": ["remote command", "remote code", "remote execution",
+                       "wmiprvse", "psexec", "services.exe", "powershell remot",
+                       "winrm", "impacket", "suspicious cmd", "command execution"],
+        "groups": ["impacket", "sysmon"],
+        "tactics": ["Execution", "Lateral Movement"],
+    },
+    "privesc": {
+        "label": "Privilege Escalation",
+        "desc_terms": ["privilege escalation", "uac bypass", "token",
+                       "elevated", "administrators group", "admin rights",
+                       "se_debug", "getsystem", "potato", "exploit"],
+        "groups": ["sysmon"],
+        "tactics": ["Privilege Escalation"],
+    },
+    "persistence": {
+        "label": "Persistence Mechanisms",
+        "desc_terms": ["persistence", "scheduled task", "new service",
+                       "registry run", "startup", "autorun", "wmi subscription",
+                       "logon script", "service created"],
+        "groups": [],
+        "tactics": ["Persistence"],
+    },
+    "credential_access": {
+        "label": "Credential Access",
+        "desc_terms": ["credential", "lsass", "mimikatz", "pass-the-hash",
+                       "ntlm", "kerberoast", "dcsync", "sam dump",
+                       "password", "hash dump"],
+        "groups": [],
+        "tactics": ["Credential Access"],
+    },
+    "lateral": {
+        "label": "Lateral Movement",
+        "desc_terms": ["lateral", "remote logon", "smb", "psexec", "wmi",
+                       "rdp", "pass-the-hash", "remote service", "admin share"],
+        "groups": ["impacket"],
+        "tactics": ["Lateral Movement"],
+    },
+    "defense_evasion": {
+        "label": "Defense Evasion",
+        "desc_terms": ["defense evasion", "cleared", "log deleted",
+                       "disabled", "bypass", "obfuscat", "encoded",
+                       "process injection", "masquerad", "timestomp"],
+        "groups": [],
+        "tactics": ["Defense Evasion"],
+    },
+    "critical": {
+        "label": "Critical Alerts Requiring Attention",
+        "desc_terms": [],   # severity-driven, not keyword
+        "groups": [],
+        "tactics": [],
+        "min_level": 12,    # only high/critical
+    },
+}
+
+def threat_hunt(category, hours=24, agent_id=None):
+    """
+    Hunt for a whole CATEGORY of threat (exfiltration, rce, privesc, etc).
+    Returns a structured briefing: matches, affected agents, top rules,
+    tactic spread, and sample events.
+    """
+    cat = THREAT_CATEGORIES.get(category)
+    if not cat:
+        return {"error": f"Unknown threat category: {category}"}
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    must  = [{"range": {"timestamp": {"gte": since}}}]
+    if agent_id:
+        must.append({"term": {"agent.id": agent_id}})
+
+    # Minimum severity floor for the category (critical = 12+)
+    min_level = cat.get("min_level", 0)
+    if min_level:
+        must.append({"range": {"rule.level": {"gte": min_level}}})
+
+    # Build should-clauses from description terms (wildcard) + groups (match)
+    should = []
+    for term in cat["desc_terms"]:
+        should.append({"wildcard": {"rule.description":
+                       {"value": f"*{term.lower()}*", "case_insensitive": True}}})
+    for grp in cat["groups"]:
+        should.append({"match": {"rule.groups": grp}})
+    # Tactic match (if the field exists in the mapping)
+    for tactic in cat["tactics"]:
+        should.append({"match_phrase": {"rule.mitre.tactic": tactic}})
+
+    if should:
+        q = {"bool": {"must": must, "should": should, "minimum_should_match": 1}}
+    else:
+        # Critical-only: no should clauses, just the severity floor
+        q = {"bool": {"must": must}}
+
+    log.info("THREAT HUNT category=%s hours=%d agent=%s", category, hours, agent_id)
+
+    aggs = {
+        "by_agent": {"terms": {"field": "agent.id", "size": 20},
+                     "aggs":  {"name": {"terms": {"field": "agent.name", "size": 1}}}},
+        "by_rule":  {"terms": {"field": "rule.description", "size": 12}},
+        "by_level": {"terms": {"field": "rule.level", "size": 15}},
+        "total":    {"value_count": {"field": "rule.level"}},
+        "max_sev":  {"max":         {"field": "rule.level"}},
+    }
+    agg = ix_agg(q, aggs)
+    hits = ix_search(q, size=15, sort=[{"rule.level": {"order": "desc"}},
+                                       {"timestamp":  {"order": "desc"}}])
+    total = agg.get("total", {}).get("value", 0)
+    log.info("THREAT HUNT result: category=%s total=%d", category, total)
+
+    return {
+        "mode":       "threat_category",
+        "category":   category,
+        "label":      cat["label"],
+        "hours":      hours,
+        "total":      total,
+        "max_sev":    agg.get("max_sev", {}).get("value", 0),
+        "by_agent":   agg.get("by_agent", {}).get("buckets", []),
+        "by_rule":    agg.get("by_rule",  {}).get("buckets", []),
+        "by_level":   agg.get("by_level", {}).get("buckets", []),
+        "tactics":    cat["tactics"],
+        "samples":    hits.get("hits", []),
+    }
+
+
+def hunt(query, days=7, agent_id=None, hunt_type="auto"):
+    """
+    Main hunt entry point.
+    hunt_type: "auto" (detect), "ioc" (force IOC), "ttp" (force TTP)
+    Returns structured result dict.
+    """
+    query = query.strip()
+    if not query:
+        return {"error": "Empty query"}
+
+    # Auto-detect type
+    if hunt_type == "auto":
+        if (_IP_RE.match(query) or _HASH_RE.match(query) or
+                _CVE_RE.match(query) or "." in query and len(query) < 50):
+            hunt_type = "ioc"
+        else:
+            hunt_type = "ttp"
+
+    if hunt_type == "ioc":
+        return _hunt_ioc(query, days, agent_id)
+    else:
+        return _hunt_ttp(query, days, agent_id)
+
 # -- Main ---------------------------------------------------------------------
 _enrolled = {}
 
