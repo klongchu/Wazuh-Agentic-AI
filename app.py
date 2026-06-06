@@ -1,16 +1,4 @@
-"""
-app.py  --  Wazuh Agentic Security Analyst  --  Web UI
 
-Agentic mode only: you ask a question, the LLM plans and runs Wazuh queries
-through tools (see agent_tools.py), and streams its investigation + verdict.
-
-Run:
-  python3 app.py
-  nohup python3 app.py > /var/log/wazuh-agent.log 2>&1 & echo $! > /tmp/wazuh-agent-ui.pid
-
-Config is read once from .env by correlate.py (single source of truth).
-Open http://<host>:5000 in any browser.
-"""
 import os, sys, json, queue, threading, time, logging, argparse
 from datetime import datetime
 from pathlib import Path
