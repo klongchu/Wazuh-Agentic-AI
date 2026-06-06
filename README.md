@@ -52,7 +52,7 @@ INDEXER_PASS=your_indexer_password
 
 # -- Ollama (the LLM backend) --
 OLLAMA_HOST=http://127.0.0.1:11434   # where Ollama listens
-AGENTIC_MODEL=qwen3      # the tool-calling model to use
+OLLAMA_MODEL=qwen3      # the tool-calling model to use
 
 # -- Optional tuning --
 AGENTIC_MAX_STEPS=18            # max tool calls per investigation
