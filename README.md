@@ -31,7 +31,7 @@ live host inventory.
 ### 1. Install dependencies
 
 ```bash
-pip install flask flask_cors ollama requests
+pip install flask flask_cors ollama openai requests
 ```
 
 ### 2. Create a `.env` file
@@ -50,9 +50,16 @@ INDEXER_HOST=https://<WAZUH_INDEXER_IP>:9200
 INDEXER_USER=admin
 INDEXER_PASS=your_indexer_password
 
-# -- Ollama (the LLM backend) --
-OLLAMA_HOST=http://127.0.0.1:11434   # where Ollama listens
-OLLAMA_MODEL=qwen3      # the tool-calling model to use
+# -- LLM backend selection --
+AI_PROVIDER=openai
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_MODEL=gpt-4.1
+# Optional: OpenAI-compatible gateway
+# OPENAI_BASE_URL=https://your-endpoint/v1
+
+# -- Ollama (optional fallback provider if you switch AI_PROVIDER) --
+OLLAMA_HOST=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3
 
 # -- Optional tuning --
 AGENTIC_MAX_STEPS=18            # max tool calls per investigation
@@ -62,6 +69,9 @@ UI_PORT=5000                    # web UI port
 
 Notes:
 
+- Default provider is OpenAI. If `AI_PROVIDER` is omitted, the app expects `OPENAI_API_KEY` to be set.
+- To use Ollama instead, set `AI_PROVIDER=ollama` and configure `OLLAMA_HOST` / `OLLAMA_MODEL`.
+- If `AI_PROVIDER=openai` and the API key is missing or the model call fails, the run stops with a clear error. The app does not silently switch to Ollama.
 - If Ollama runs on a different machine (e.g. a GPU host), make sure it listens on the network (`OLLAMA_HOST=0.0.0.0:11434` on that host) and the port is open.
 
 
