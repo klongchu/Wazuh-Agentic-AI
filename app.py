@@ -16,7 +16,9 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("app")
 
-AGENTIC_MODEL = ag.C["AGENTIC_MODEL"]
+AI_PROVIDER   = ag.C["AI_PROVIDER"]
+AGENTIC_MODEL = ag.active_model()
+MODEL_LABEL   = ag.provider_label()
 UI_PORT       = ag.C["UI_PORT"]
 UI_HOST       = ag.C["UI_HOST"]
 
@@ -214,8 +216,13 @@ def set_schedule():
 
 @app.route("/status")
 def status():
-    return jsonify({"running": ST.lock.locked(), "model": AGENTIC_MODEL,
-                    "schedule": ST.sched_cfg})
+    return jsonify({
+        "running": ST.lock.locked(),
+        "provider": AI_PROVIDER,
+        "model": AGENTIC_MODEL,
+        "label": MODEL_LABEL,
+        "schedule": ST.sched_cfg,
+    })
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -736,7 +743,7 @@ setInterval(_loadHistoryData, 15000);
 
 @app.route("/")
 def index():
-    return render_template_string(HTML, model=AGENTIC_MODEL)
+    return render_template_string(HTML, model=MODEL_LABEL)
 
 
 PID_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.pid")
@@ -755,8 +762,9 @@ def _serve(args):
     ST.log_file = args.log_file
     threading.Thread(target=_scheduler, daemon=True).start()
     print("Wazuh Agentic Security Analyst")
-    print(f"  UI      : http://{args.host}:{args.port}")
+    print(f"  Provider: {AI_PROVIDER}")
     print(f"  Model   : {AGENTIC_MODEL}")
+    print(f"  UI      : http://{args.host}:{args.port}")
     print(f"  History : {ST.hist_file}")
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
