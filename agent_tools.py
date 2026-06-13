@@ -11,9 +11,10 @@ import client as ag
 
 log = logging.getLogger("agent")
 
-AGENTIC_MODEL = ag.C["AGENTIC_MODEL"]
-OL_HOST       = ag.C["OL_HOST"]
-MAX_STEPS     = ag.C["AGENTIC_MAX_STEPS"]   # safety cap on the loop
+ACTIVE_PROVIDER = ag.C["AI_PROVIDER"]
+ACTIVE_MODEL    = ag.active_model()
+OL_HOST         = ag.C["OL_HOST"]
+MAX_STEPS       = ag.C["AGENTIC_MAX_STEPS"]   # safety cap on the loop
 
 _agent_cache = {}   # name/id (lower) -> id
 
@@ -603,6 +604,105 @@ SYSTEM_PROMPT = (
 )
 
 
+def _normalize_tool_args(raw_args):
+    if isinstance(raw_args, dict):
+        return raw_args
+    if isinstance(raw_args, str):
+        try:
+            return json.loads(raw_args)
+        except Exception:
+            return {}
+    return {}
+
+
+def _normalize_response(content, tool_calls):
+    out = []
+    for tc in tool_calls or []:
+        fn = getattr(tc, "function", None)
+        if fn is not None:
+            out.append({
+                "id": getattr(tc, "id", None),
+                "name": fn.name,
+                "args": _normalize_tool_args(fn.arguments),
+            })
+        else:
+            out.append({
+                "id": tc.get("id"),
+                "name": tc["function"]["name"],
+                "args": _normalize_tool_args(tc["function"].get("arguments")),
+            })
+    return {"content": content or "", "tool_calls": out}
+
+
+def _provider_messages(messages):
+    if ag.C["AI_PROVIDER"] != "openai":
+        return messages
+    out = []
+    for m in messages:
+        item = {"role": m["role"], "content": m.get("content", "")}
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            item["tool_calls"] = m["tool_calls"]
+        if m["role"] == "tool":
+            item["tool_call_id"] = m.get("tool_call_id", m.get("name", "tool"))
+        out.append(item)
+    return out
+
+
+def _chat_with_ollama(messages, tools=None, final_only=False):
+    client = ollama.Client(host=OL_HOST)
+    kwargs = {
+        "model": ag.C["OLLAMA_MODEL"],
+        "messages": messages,
+        "options": {"temperature": 0, "num_ctx": 16384},
+    }
+    if not final_only and tools:
+        kwargs["tools"] = tools
+    if final_only:
+        kwargs["options"] = {"temperature": 0, "num_predict": 1200}
+    resp = client.chat(**kwargs)
+    msg = resp.message
+    return _normalize_response(msg.content, getattr(msg, "tool_calls", None) or [])
+
+
+def _chat_with_openai(messages, tools=None, final_only=False):
+    client = ag.openai_client()
+    kwargs = {
+        "model": ag.C["OPENAI_MODEL"],
+        "messages": _provider_messages(messages),
+        "temperature": 0,
+    }
+    if not final_only and tools:
+        kwargs["tools"] = tools
+    resp = client.chat.completions.create(**kwargs)
+    msg = resp.choices[0].message
+    tool_calls = []
+    for tc in msg.tool_calls or []:
+        tool_calls.append({
+            "id": tc.id,
+            "function": {
+                "name": tc.function.name,
+                "arguments": tc.function.arguments,
+            },
+        })
+    return _normalize_response(msg.content, tool_calls)
+
+
+def _chat_with_provider(messages, tools=None, final_only=False):
+    if ag.C["AI_PROVIDER"] == "openai":
+        return _chat_with_openai(messages, tools=tools, final_only=final_only)
+    return _chat_with_ollama(messages, tools=tools, final_only=final_only)
+
+
+def _assistant_tool_calls(tool_calls):
+    if ag.C["AI_PROVIDER"] != "openai":
+        return tool_calls
+    return [{
+        "id": tc.get("id") or tc["name"],
+        "type": "function",
+        "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])},
+    } for tc in tool_calls]
+
+
 def run_agent(question: str, agent_id: str = None, emit=None):
     """
     Run the agentic investigation loop.
@@ -633,8 +733,6 @@ def run_agent(question: str, agent_id: str = None, emit=None):
             elif kind == "error":
                 print(f"\n[ERROR] {payload}")
 
-    client = ollama.Client(host=OL_HOST)
-
     user_msg = question
     if agent_id:
         user_msg = f"(Focus on agent {agent_id}.) {question}"
@@ -652,12 +750,7 @@ def run_agent(question: str, agent_id: str = None, emit=None):
             return "[stopped]"
 
         try:
-            resp = client.chat(
-                model=AGENTIC_MODEL,
-                messages=messages,
-                tools=TOOL_SCHEMAS,
-                options={"temperature": 0, "num_ctx": 16384},
-            )
+            resp = _chat_with_provider(messages, tools=TOOL_SCHEMAS, final_only=False)
         except Exception as e:
             _emit("error", f"Model call failed: {e}")
             return f"[error: {e}]"
@@ -666,12 +759,12 @@ def run_agent(question: str, agent_id: str = None, emit=None):
             _emit("error", "Stopped by user.")
             return "[stopped]"
 
-        msg = resp.message
-        tool_calls = getattr(msg, "tool_calls", None) or []
+        msg_content = resp["content"]
+        tool_calls = resp["tool_calls"]
 
         # No tool calls → the model is giving its final answer
         if not tool_calls:
-            answer = msg.content or "(no answer)"
+            answer = msg_content or "(no answer)"
             _emit("answer", answer)
             _emit("done", {"steps": step, "audit": audit})
             return answer
@@ -679,18 +772,19 @@ def run_agent(question: str, agent_id: str = None, emit=None):
         # Append the assistant turn (with its tool-call requests) to history.
         # If the model also emitted reasoning text, surface it (it often
         # contains the running hypothesis) so nothing is silently dropped.
-        if msg.content and msg.content.strip():
-            _emit("thinking", msg.content.strip())
-        messages.append({"role": "assistant", "content": msg.content or "",
-                         "tool_calls": tool_calls})
+        if msg_content and msg_content.strip():
+            _emit("thinking", msg_content.strip())
+        messages.append({
+            "role": "assistant",
+            "content": msg_content or "",
+            "tool_calls": _assistant_tool_calls(tool_calls),
+        })
 
         # Execute each requested tool
         for tc in tool_calls:
-            name = tc.function.name
-            args = tc.function.arguments
-            if isinstance(args, str):
-                try:    args = json.loads(args)
-                except Exception: args = {}
+            name = tc["name"]
+            args = tc["args"]
+            call_id = tc.get("id")
 
             if ag.STOP_FLAG.is_set():
                 _emit("error", "Stopped by user.")
@@ -715,8 +809,11 @@ def run_agent(question: str, agent_id: str = None, emit=None):
 
             _emit("tool_result", {"name": name, "result": result})
 
-            messages.append({"role": "tool", "name": name,
-                             "content": json.dumps(result)[:4000]})
+            tool_msg = {"role": "tool", "name": name,
+                        "content": json.dumps(result)[:4000]}
+            if call_id:
+                tool_msg["tool_call_id"] = call_id
+            messages.append(tool_msg)
 
     # Hit the step cap — force a final text answer.
     # Crucially: do NOT pass tools, so the model cannot ask for more calls and
@@ -731,9 +828,8 @@ def run_agent(question: str, agent_id: str = None, emit=None):
     answer = ""
     for _try in range(2):
         try:
-            resp = client.chat(model=AGENTIC_MODEL, messages=messages,
-                               options={"temperature": 0, "num_predict": 1200})
-            answer = (resp.message.content or "").strip()
+            resp = _chat_with_provider(messages, tools=None, final_only=True)
+            answer = (resp["content"] or "").strip()
             if answer:
                 break
             # Empty — nudge harder
@@ -764,8 +860,10 @@ if __name__ == "__main__":
         args = args[:i] + args[i + 2:]
     question = " ".join(args) or "Are there any signs of compromise in the last 24 hours?"
 
-    print(f"Model    : {AGENTIC_MODEL}")
-    print(f"Ollama   : {OL_HOST}")
+    print(f"Provider : {ag.C['AI_PROVIDER']}")
+    print(f"Model    : {ag.active_model()}")
+    if ag.C["AI_PROVIDER"] == "ollama":
+        print(f"Ollama   : {OL_HOST}")
     print(f"Question : {question}")
     if agent:
         print(f"Agent    : {agent}")
