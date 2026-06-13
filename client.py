@@ -2,6 +2,7 @@ import os, sys, json, argparse, requests, urllib3, logging, time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import ollama
+from openai import OpenAI
 
 urllib3.disable_warnings()
 
@@ -21,8 +22,12 @@ C = {
     "IX_HOST": os.getenv("INDEXER_HOST",  "https://localhost:9200"),
     "IX_USER": os.getenv("INDEXER_USER",  "admin"),
     "IX_PASS": os.getenv("INDEXER_PASS",  "admin"),
+    "AI_PROVIDER": os.getenv("AI_PROVIDER", "openai").strip().lower(),
+    "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
+    "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4.1"),
+    "OPENAI_BASE_URL": os.getenv("OPENAI_BASE_URL", "").strip(),
     "OL_HOST": os.getenv("OLLAMA_HOST",   "http://localhost:11434"),
-    "AGENTIC_MODEL": os.getenv("OLLAMA_MODEL", "qwen3"),
+    "OLLAMA_MODEL": os.getenv("OLLAMA_MODEL", "qwen3"),
     "AGENTIC_MAX_STEPS": int(os.getenv("AGENTIC_MAX_STEPS", "18")),
     "UI_PORT": int(os.getenv("UI_PORT", "5000")),
     "UI_HOST": os.getenv("UI_HOST", "0.0.0.0"),
@@ -30,6 +35,36 @@ C = {
 SSL     = os.getenv("WAZUH_SSL","false").lower() == "true"
 MIN_SEV = int(os.getenv("MIN_SEVERITY","3"))
 HOURS   = int(os.getenv("LOOK_BACK_HOURS","24"))
+
+def active_model():
+    return C["OPENAI_MODEL"] if C["AI_PROVIDER"] == "openai" else C["OLLAMA_MODEL"]
+
+
+def provider_label():
+    return f"{C['AI_PROVIDER']} / {active_model()}"
+
+
+def _validate_config():
+    provider = C["AI_PROVIDER"]
+    if provider not in ("openai", "ollama"):
+        raise RuntimeError(
+            f"Unsupported AI_PROVIDER={provider!r}. Use 'openai' or 'ollama'."
+        )
+    if provider == "openai" and not C["OPENAI_API_KEY"]:
+        raise RuntimeError(
+            "OPENAI_API_KEY is required when AI_PROVIDER=openai. "
+            "Set it in .env beside app.py."
+        )
+
+
+_validate_config()
+
+
+def openai_client():
+    kwargs = {"api_key": C["OPENAI_API_KEY"]}
+    if C["OPENAI_BASE_URL"]:
+        kwargs["base_url"] = C["OPENAI_BASE_URL"]
+    return OpenAI(**kwargs)
 
 # -- Logger --------------------------------------------------------------------
 def _setup_logger(debug=False):
