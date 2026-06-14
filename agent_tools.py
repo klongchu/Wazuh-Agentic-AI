@@ -5,16 +5,13 @@ import time
 import logging
 from datetime import datetime, timezone, timedelta
 
-import ollama
 
 import client as ag
 
 log = logging.getLogger("agent")
 
-ACTIVE_PROVIDER = ag.C["AI_PROVIDER"]
-ACTIVE_MODEL    = ag.active_model()
-OL_HOST         = ag.C["OL_HOST"]
-MAX_STEPS       = ag.C["AGENTIC_MAX_STEPS"]   # safety cap on the loop
+AGENTIC_MODEL = ag.active_model()
+MAX_STEPS     = ag.C["AGENTIC_MAX_STEPS"]   # safety cap on the loop
 
 _agent_cache = {}   # name/id (lower) -> id
 
@@ -601,106 +598,36 @@ SYSTEM_PROMPT = (
     "timestamps from YOUR tool calls), and what it means. Recommendations are fine "
     "only AFTER you have done the investigation yourself. Be precise and cite the "
     "numbers your tools returned. Plain text, no markdown headers."
+    "Please answer in Thai."
 )
 
 
-def _normalize_tool_args(raw_args):
-    if isinstance(raw_args, dict):
-        return raw_args
-    if isinstance(raw_args, str):
-        try:
-            return json.loads(raw_args)
-        except Exception:
-            return {}
-    return {}
+def _openai_tools():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": schema["function"]["name"],
+                "description": schema["function"]["description"],
+                "parameters": schema["function"]["parameters"],
+            },
+        }
+        for schema in TOOL_SCHEMAS
+    ]
 
 
-def _normalize_response(content, tool_calls):
-    out = []
-    for tc in tool_calls or []:
-        fn = getattr(tc, "function", None)
-        if fn is not None:
-            out.append({
-                "id": getattr(tc, "id", None),
-                "name": fn.name,
-                "args": _normalize_tool_args(fn.arguments),
-            })
-        else:
-            out.append({
-                "id": tc.get("id"),
-                "name": tc["function"]["name"],
-                "args": _normalize_tool_args(tc["function"].get("arguments")),
-            })
-    return {"content": content or "", "tool_calls": out}
-
-
-def _provider_messages(messages):
-    if ag.C["AI_PROVIDER"] != "openai":
-        return messages
-    out = []
-    for m in messages:
-        item = {"role": m["role"], "content": m.get("content", "")}
-        if m["role"] == "assistant" and m.get("tool_calls"):
-            item["tool_calls"] = m["tool_calls"]
-        if m["role"] == "tool":
-            item["tool_call_id"] = m.get("tool_call_id", m.get("name", "tool"))
-        out.append(item)
-    return out
-
-
-def _chat_with_ollama(messages, tools=None, final_only=False):
-    client = ollama.Client(host=OL_HOST)
+def _openai_chat(client, messages, allow_tools=True, max_output_tokens=None):
     kwargs = {
-        "model": ag.C["OLLAMA_MODEL"],
+        "model": AGENTIC_MODEL,
         "messages": messages,
-        "options": {"temperature": 0, "num_ctx": 16384},
-    }
-    if not final_only and tools:
-        kwargs["tools"] = tools
-    if final_only:
-        kwargs["options"] = {"temperature": 0, "num_predict": 1200}
-    resp = client.chat(**kwargs)
-    msg = resp.message
-    return _normalize_response(msg.content, getattr(msg, "tool_calls", None) or [])
-
-
-def _chat_with_openai(messages, tools=None, final_only=False):
-    client = ag.openai_client()
-    kwargs = {
-        "model": ag.C["OPENAI_MODEL"],
-        "messages": _provider_messages(messages),
         "temperature": 0,
     }
-    if not final_only and tools:
-        kwargs["tools"] = tools
-    resp = client.chat.completions.create(**kwargs)
-    msg = resp.choices[0].message
-    tool_calls = []
-    for tc in msg.tool_calls or []:
-        tool_calls.append({
-            "id": tc.id,
-            "function": {
-                "name": tc.function.name,
-                "arguments": tc.function.arguments,
-            },
-        })
-    return _normalize_response(msg.content, tool_calls)
-
-
-def _chat_with_provider(messages, tools=None, final_only=False):
-    if ag.C["AI_PROVIDER"] == "openai":
-        return _chat_with_openai(messages, tools=tools, final_only=final_only)
-    return _chat_with_ollama(messages, tools=tools, final_only=final_only)
-
-
-def _assistant_tool_calls(tool_calls):
-    if ag.C["AI_PROVIDER"] != "openai":
-        return tool_calls
-    return [{
-        "id": tc.get("id") or tc["name"],
-        "type": "function",
-        "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])},
-    } for tc in tool_calls]
+    if allow_tools:
+        kwargs["tools"] = _openai_tools()
+        kwargs["tool_choice"] = "auto"
+    if max_output_tokens:
+        kwargs["max_tokens"] = max_output_tokens
+    return client.chat.completions.create(**kwargs)
 
 
 def run_agent(question: str, agent_id: str = None, emit=None):
@@ -720,18 +647,19 @@ def run_agent(question: str, agent_id: str = None, emit=None):
             emit(kind, payload)
         else:
             if kind == "thinking":
-                # Show a short preview of the model's reasoning between calls
                 preview = payload[:200].replace("\n", " ")
                 print(f"\n  ~ {preview}{'...' if len(payload) > 200 else ''}")
             elif kind == "tool_call":
-                print(f"\n  -> TOOL: {payload['name']}({json.dumps(payload['args'])})")
+                print(f"\n  → TOOL: {payload['name']}({json.dumps(payload['args'])})")
             elif kind == "tool_result":
                 preview = json.dumps(payload["result"])[:300]
-                print(f"  <- {preview}{'...' if len(preview) >= 300 else ''}")
+                print(f"  ← {preview}{'...' if len(preview) >= 300 else ''}")
             elif kind == "answer":
                 print(f"\n{payload}")
             elif kind == "error":
                 print(f"\n[ERROR] {payload}")
+
+    client = ag.openai_client()
 
     user_msg = question
     if agent_id:
@@ -739,10 +667,10 @@ def run_agent(question: str, agent_id: str = None, emit=None):
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": user_msg},
+        {"role": "user", "content": user_msg},
     ]
 
-    audit = []   # full record of every tool call, for the SIEM trail
+    audit = []
 
     for step in range(MAX_STEPS):
         if ag.STOP_FLAG.is_set():
@@ -750,7 +678,7 @@ def run_agent(question: str, agent_id: str = None, emit=None):
             return "[stopped]"
 
         try:
-            resp = _chat_with_provider(messages, tools=TOOL_SCHEMAS, final_only=False)
+            resp = _openai_chat(client, messages, allow_tools=True)
         except Exception as e:
             _emit("error", f"Model call failed: {e}")
             return f"[error: {e}]"
@@ -759,32 +687,42 @@ def run_agent(question: str, agent_id: str = None, emit=None):
             _emit("error", "Stopped by user.")
             return "[stopped]"
 
-        msg_content = resp["content"]
-        tool_calls = resp["tool_calls"]
+        msg = resp.choices[0].message
+        tool_calls = msg.tool_calls or []
+        content = msg.content or ""
 
-        # No tool calls → the model is giving its final answer
         if not tool_calls:
-            answer = msg_content or "(no answer)"
+            answer = content or "(no answer)"
             _emit("answer", answer)
             _emit("done", {"steps": step, "audit": audit})
             return answer
 
-        # Append the assistant turn (with its tool-call requests) to history.
-        # If the model also emitted reasoning text, surface it (it often
-        # contains the running hypothesis) so nothing is silently dropped.
-        if msg_content and msg_content.strip():
-            _emit("thinking", msg_content.strip())
-        messages.append({
-            "role": "assistant",
-            "content": msg_content or "",
-            "tool_calls": _assistant_tool_calls(tool_calls),
-        })
+        if content.strip():
+            _emit("thinking", content.strip())
 
-        # Execute each requested tool
+        assistant_msg = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ]
+        messages.append(assistant_msg)
+
         for tc in tool_calls:
-            name = tc["name"]
-            args = tc["args"]
-            call_id = tc.get("id")
+            name = tc.function.name
+            args = tc.function.arguments
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
 
             if ag.STOP_FLAG.is_set():
                 _emit("error", "Stopped by user.")
@@ -808,16 +746,12 @@ def run_agent(question: str, agent_id: str = None, emit=None):
                     result = {"error": str(e)}
 
             _emit("tool_result", {"name": name, "result": result})
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result)[:4000],
+            })
 
-            tool_msg = {"role": "tool", "name": name,
-                        "content": json.dumps(result)[:4000]}
-            if call_id:
-                tool_msg["tool_call_id"] = call_id
-            messages.append(tool_msg)
-
-    # Hit the step cap — force a final text answer.
-    # Crucially: do NOT pass tools, so the model cannot ask for more calls and
-    # must produce prose. Retry once if it still comes back empty.
     messages.append({"role": "user",
                      "content": "STOP investigating now — you have reached the "
                                 "step limit. Do NOT request any more tools. Based "
@@ -828,11 +762,10 @@ def run_agent(question: str, agent_id: str = None, emit=None):
     answer = ""
     for _try in range(2):
         try:
-            resp = _chat_with_provider(messages, tools=None, final_only=True)
-            answer = (resp["content"] or "").strip()
+            resp = _openai_chat(client, messages, allow_tools=False, max_output_tokens=1200)
+            answer = (resp.choices[0].message.content or "").strip()
             if answer:
                 break
-            # Empty — nudge harder
             messages.append({"role": "user",
                              "content": "Write the final answer as plain text now."})
         except Exception as e:
@@ -860,16 +793,13 @@ if __name__ == "__main__":
         args = args[:i] + args[i + 2:]
     question = " ".join(args) or "Are there any signs of compromise in the last 24 hours?"
 
-    print(f"Provider : {ag.C['AI_PROVIDER']}")
-    print(f"Model    : {ag.active_model()}")
-    if ag.C["AI_PROVIDER"] == "ollama":
-        print(f"Ollama   : {OL_HOST}")
+    print(f"Model    : {AGENTIC_MODEL}")
     print(f"Question : {question}")
     if agent:
         print(f"Agent    : {agent}")
-    print("-" * 60)
+    print("─" * 60)
 
     t0 = time.perf_counter()
     run_agent(question, agent_id=agent)
-    print("-" * 60)
+    print("─" * 60)
     print(f"Completed in {int(time.perf_counter() - t0)}s")
