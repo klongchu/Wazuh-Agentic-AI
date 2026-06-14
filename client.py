@@ -10,9 +10,11 @@ urllib3.disable_warnings()
 def _env(p=".env"):
     if Path(p).exists():
         for line in Path(p).read_text().splitlines():
-            if line.strip() and "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            raw = line.strip()
+            if raw and "=" in raw and not raw.startswith("#"):
+                k, _, v = raw.partition("=")
+                value = v.split(" #", 1)[0].strip().strip('"').strip("'")
+                os.environ.setdefault(k.strip(), value)
 _env()
 
 C = {
