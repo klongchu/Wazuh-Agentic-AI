@@ -867,9 +867,9 @@ if __name__ == "__main__":
     print(f"Question : {question}")
     if agent:
         print(f"Agent    : {agent}")
-    print("─" * 60)
+    print("-" * 60)
 
     t0 = time.perf_counter()
     run_agent(question, agent_id=agent)
-    print("─" * 60)
+    print("-" * 60)
     print(f"Completed in {int(time.perf_counter() - t0)}s")
