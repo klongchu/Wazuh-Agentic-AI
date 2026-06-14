@@ -724,10 +724,10 @@ def run_agent(question: str, agent_id: str = None, emit=None):
                 preview = payload[:200].replace("\n", " ")
                 print(f"\n  ~ {preview}{'...' if len(payload) > 200 else ''}")
             elif kind == "tool_call":
-                print(f"\n  → TOOL: {payload['name']}({json.dumps(payload['args'])})")
+                print(f"\n  -> TOOL: {payload['name']}({json.dumps(payload['args'])})")
             elif kind == "tool_result":
                 preview = json.dumps(payload["result"])[:300]
-                print(f"  ← {preview}{'...' if len(preview) >= 300 else ''}")
+                print(f"  <- {preview}{'...' if len(preview) >= 300 else ''}")
             elif kind == "answer":
                 print(f"\n{payload}")
             elif kind == "error":
