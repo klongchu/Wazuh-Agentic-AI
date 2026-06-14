@@ -1,7 +1,10 @@
 import os, sys, json, argparse, requests, urllib3, logging, time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-import ollama
+try:
+    import ollama
+except ModuleNotFoundError:
+    ollama = None
 from openai import OpenAI
 
 urllib3.disable_warnings()
@@ -56,6 +59,10 @@ def _validate_config():
         raise RuntimeError(
             "OPENAI_API_KEY is required when AI_PROVIDER=openai. "
             "Set it in .env beside app.py."
+        )
+    if provider == "ollama" and ollama is None:
+        raise RuntimeError(
+            "AI_PROVIDER=ollama requires `ollama` package to be installed."
         )
 
 

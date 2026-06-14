@@ -630,6 +630,30 @@ def _openai_chat(client, messages, allow_tools=True, max_output_tokens=None):
     return client.chat.completions.create(**kwargs)
 
 
+def _force_final_answer(client, messages, audit):
+    retry_messages = list(messages)
+    retry_messages.append({
+        "role": "user",
+        "content": "Write the final answer now in Thai based only on gathered evidence. Plain text, no markdown headers.",
+    })
+    answer = ""
+    for _try in range(2):
+        try:
+            resp = _openai_chat(client, retry_messages, allow_tools=False, max_output_tokens=1200)
+            answer = (resp.choices[0].message.content or "").strip()
+            if answer:
+                return answer
+            retry_messages.append({
+                "role": "user",
+                "content": "Final answer required now. Thai only. Use only prior tool evidence.",
+            })
+        except Exception as e:
+            return f"[error producing final answer: {e}]"
+    return ("[The investigation gathered evidence across "
+            + str(len(audit)) + " tool calls but did not produce a final "
+            "summary. See the tool-call audit for the raw findings.]")
+
+
 def run_agent(question: str, agent_id: str = None, emit=None):
     """
     Run the agentic investigation loop.
@@ -692,7 +716,7 @@ def run_agent(question: str, agent_id: str = None, emit=None):
         content = msg.content or ""
 
         if not tool_calls:
-            answer = content or "(no answer)"
+            answer = content.strip() or _force_final_answer(client, messages, audit)
             _emit("answer", answer)
             _emit("done", {"steps": step, "audit": audit})
             return answer
@@ -759,23 +783,7 @@ def run_agent(question: str, agent_id: str = None, emit=None):
                                 "your complete final answer now: verdict, the "
                                 "specific events/entities/timestamps you found, what "
                                 "attack chain they represent, and recommended actions."})
-    answer = ""
-    for _try in range(2):
-        try:
-            resp = _openai_chat(client, messages, allow_tools=False, max_output_tokens=1200)
-            answer = (resp.choices[0].message.content or "").strip()
-            if answer:
-                break
-            messages.append({"role": "user",
-                             "content": "Write the final answer as plain text now."})
-        except Exception as e:
-            answer = f"[error producing final answer: {e}]"
-            break
-    if not answer:
-        answer = ("[The investigation gathered evidence across "
-                  + str(len(audit)) + " tool calls but did not produce a final "
-                  "summary within the step limit. See the tool-call audit for "
-                  "the raw findings.]")
+    answer = _force_final_answer(client, messages, audit)
     _emit("answer", answer)
     _emit("done", {"steps": MAX_STEPS, "audit": audit, "capped": True})
     return answer
