@@ -28,7 +28,7 @@ class State:
     def __init__(self):
         self.lock       = threading.Lock()   # one investigation at a time
         self.log_file   = ""
-        self.sched_cfg  = {"enabled": False, "interval_hours": 8, "hours": 24}
+        self.sched_cfg  = {"enabled": False, "interval_minutes": 5, "hours": 24}
         self.sched_wake = threading.Event()
         self.history    = OrderedDict()
         self.hist_lock  = threading.Lock()
@@ -233,7 +233,7 @@ def _scheduler():
         if not cfg["enabled"]:
             ST.sched_wake.wait(60); ST.sched_wake.clear(); continue
         last = getattr(ST, "_last_sched", 0)
-        wait = max(0, last + cfg["interval_hours"]*3600 - time.time())
+        wait = max(0, last + cfg["interval_minutes"]*60 - time.time())
         if wait > 0:
             ST.sched_wake.wait(wait); ST.sched_wake.clear(); continue
         if ST.lock.acquire(blocking=False):
@@ -294,6 +294,7 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
 #nl-input{flex:1;min-width:0;background:#0b1220;border:1px solid #2d3b50;border-radius:14px;color:var(--text);font-size:14px;padding:14px 16px;font-family:inherit}
 #nl-input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(88,166,255,.12)}
 #nl-input::placeholder{color:#667085}
+.filter-row{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
 .btn-primary,.btn-stop{border:none;border-radius:14px;padding:0 18px;font-weight:600;cursor:pointer;min-width:108px}
 .btn-primary{background:linear-gradient(180deg,#2f81f7,#1f6feb);color:#fff}.btn-primary:hover{filter:brightness(1.05)}
 .btn-stop{background:#da3633;color:#fff}.btn-stop:hover:not(:disabled){filter:brightness(1.05)}
@@ -334,9 +335,16 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
   <section class="console-pane">
     <div class="controls">
       <div class="prompt-row">
-        <input id="nl-input" type="text" autocomplete="off" spellcheck="false" placeholder="Ask anything — e.g. perform alert triage on the last 24 hours" onkeydown="if(event.key==='Enter')askConfirm()">
+        <input id="nl-input" type="text" autocomplete="off" spellcheck="false" value="ช่วยวิเคราะห์ alert severity 12 ขึ้นไป ในช่วง 4 ชั่วโมงล่าสุด" placeholder="พิมพ์คำถามด้านความปลอดภัยเป็นภาษาไทย" onkeydown="if(event.key==='Enter')askConfirm()">
         <button class="btn-primary" onclick="askConfirm()">Run now</button>
         <button class="btn-stop" id="stop-btn" onclick="stopRun()" disabled>Stop</button>
+      </div>
+      <div class="filter-row">
+        <span class="toggle-pill">Filter</span>
+        <span>Hours</span>
+        <input type="number" id="run-hours" value="4" min="1" max="720" style="width:70px;background:#0b1220;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:6px 8px">
+        <span>Level</span>
+        <input type="number" id="run-level" value="12" min="0" max="15" style="width:70px;background:#0b1220;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:6px 8px">
       </div>
       <div class="preview" id="nl-preview"></div>
     </div>
@@ -344,8 +352,8 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
       <span class="toggle-pill">Live investigation first</span>
       <label class="toggle-pill"><input type="checkbox" id="sched-on" onchange="updateSched()" style="margin-right:6px">Auto triage</label>
       <span>Every</span>
-      <input type="number" id="sched-hours" value="8" min="1" max="72" onchange="updateSched()" style="width:60px;background:#0b1220;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:6px 8px">
-      <span>hours</span>
+      <input type="number" id="sched-minutes" value="5" min="1" max="1440" onchange="updateSched()" style="width:70px;background:#0b1220;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:6px 8px">
+      <span>minutes</span>
       <span>Window</span>
       <input type="number" id="sched-window" value="24" min="1" max="336" onchange="updateSched()" style="width:70px;background:#0b1220;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:6px 8px">
       <span>hours</span>
@@ -353,7 +361,7 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
     </div>
     <div class="live-wrap">
       <div class="live-header"><div class="live-dot" id="dot"></div><span class="live-title" id="live-title">Output</span><span class="elapsed" id="elapsed"></span><button id="copy-live-btn" onclick="copyLive()" style="margin-left:auto;font-size:11px;padding:6px 10px;background:#1f2937;color:#c9d1d9;border:1px solid var(--line2);border-radius:10px;cursor:pointer">Copy</button></div>
-      <div id="live-out">Ready. Ask a question above and click Run now.</div>
+      <div id="live-out">พร้อมใช้งาน แก้ prompt ภาษาไทยด้านบน แล้วกด Run now ได้เลย</div>
       <div class="status-bar"><span id="status-text">idle</span><span style="margin-left:auto" id="last-run"></span></div>
     </div>
     <div class="report-shell">
@@ -368,11 +376,11 @@ function toggleSidebar(){_sidebarCollapsed=!_sidebarCollapsed;document.getElemen
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function switchBadge(state){const b=document.getElementById('status-badge');b.className='badge state-'+state;b.textContent=state}
 function switchStateDot(state){const d=document.getElementById('dot');d.className='live-dot'+(state==='running'?' running':state==='error'?' error':'')}
-function askConfirm(){const q=document.getElementById('nl-input').value.trim();if(!q||_running)return;_pendingQ=q;const p=document.getElementById('nl-preview');p.style.display='block';p.innerHTML='<div class="confirm-q">Run agentic investigation?<br><strong>"'+esc(q)+'"</strong></div><div class="confirm-note">The agent will plan and run multiple Wazuh queries. This may take several minutes.</div><button class="confirm-yes" onclick="confirmRun()">Yes, do it</button><button class="confirm-no" onclick="cancelConfirm()">Cancel</button>'}
+function askConfirm(){const q=document.getElementById('nl-input').value.trim();if(!q||_running)return;_pendingQ={q,hours:+document.getElementById('run-hours').value||4,level:+document.getElementById('run-level').value||12};const p=document.getElementById('nl-preview');p.style.display='block';p.innerHTML='<div class="confirm-q">Run agentic investigation?<br><strong>"'+esc(q)+'"</strong></div><div class="confirm-note">Filter: last '+_pendingQ.hours+' hours, min level '+_pendingQ.level+'.</div><button class="confirm-yes" onclick="confirmRun()">Yes, do it</button><button class="confirm-no" onclick="cancelConfirm()">Cancel</button>'}
 function cancelConfirm(){_pendingQ=null;document.getElementById('nl-preview').style.display='none'}
-function confirmRun(){const q=_pendingQ;document.getElementById('nl-preview').style.display='none';if(!q)return;startAgent(q)}
+function confirmRun(){const p=_pendingQ;document.getElementById('nl-preview').style.display='none';if(!p)return;startAgent(p.q,p.hours,p.level)}
 function appendLive(kind,text){const out=document.getElementById('live-out');const row=document.createElement('div');row.className='stream-row event-'+kind;row.textContent=text;out.appendChild(row);out.scrollTop=out.scrollHeight}
-function startAgent(question){if(_running)return;const out=document.getElementById('live-out');out.innerHTML='';_liveBuffer='';_curRunId=null;document.getElementById('live-title').textContent='Investigating';switchBadge('running');switchStateDot('running');setRunning(true);_t0=Date.now();_timer=setInterval(()=>{document.getElementById('elapsed').textContent=Math.floor((Date.now()-_t0)/1000)+'s'},1000);_es=new EventSource('/agent?q='+encodeURIComponent(question));_es.onmessage=(e)=>{const d=e.data;if(d==='__DONE__'){finish(false);return}if(d.startsWith('__RUNID__')){_curRunId=d.slice(9);return}_liveBuffer+=d+'\n';const t=d.trim();if(t.startsWith('[thinking]'))appendLive('thinking',t);else if(t.startsWith('→'))appendLive('tool_call',t);else if(t.startsWith('←'))appendLive('tool_result',t);else if(t.startsWith('[error]'))appendLive('error',t);else if(t.includes('FINAL ASSESSMENT'))appendLive('answer',t);else appendLive('tool_result',t)};_es.onerror=()=>{finish(true)}}
+function startAgent(question,hours,level){if(_running)return;const out=document.getElementById('live-out');out.innerHTML='';_liveBuffer='';_curRunId=null;document.getElementById('live-title').textContent='Investigating';switchBadge('running');switchStateDot('running');setRunning(true);_t0=Date.now();_timer=setInterval(()=>{document.getElementById('elapsed').textContent=Math.floor((Date.now()-_t0)/1000)+'s'},1000);const scopedQuestion=question+' (Filter last '+hours+' hours, min level '+level+')';_es=new EventSource('/agent?q='+encodeURIComponent(scopedQuestion));_es.onmessage=(e)=>{const d=e.data;if(d==='__DONE__'){finish(false);return}if(d.startsWith('__RUNID__')){_curRunId=d.slice(9);return}_liveBuffer+=d+'\n';const t=d.trim();if(t.startsWith('[thinking]'))appendLive('thinking',t);else if(t.startsWith('→'))appendLive('tool_call',t);else if(t.startsWith('←'))appendLive('tool_result',t);else if(t.startsWith('[error]'))appendLive('error',t);else if(t.includes('FINAL ASSESSMENT'))appendLive('answer',t);else appendLive('tool_result',t)};_es.onerror=()=>{finish(true)}}
 function stopRun(){fetch('/stop',{method:'POST'});if(_es){_es.close();_es=null}clearInterval(_timer);setRunning(false);document.getElementById('elapsed').textContent='';document.getElementById('live-title').textContent='Output — stopped';switchBadge('stopped');switchStateDot('');const note=document.createElement('div');note.className='stream-row event-error';note.textContent='Stopped by user. A model step already in progress may finish in the background, but its result is discarded.';document.getElementById('live-out').appendChild(note);_loadHistoryData()}
 function finish(err){clearInterval(_timer);if(_es){_es.close();_es=null}setRunning(false);switchBadge(err?'error':'idle');switchStateDot(err?'error':'');document.getElementById('elapsed').textContent='';document.getElementById('live-title').textContent='Output';document.getElementById('last-run').textContent='completed '+new Date().toLocaleTimeString();_loadHistoryData()}
 function setRunning(on){_running=on;document.getElementById('stop-btn').disabled=!on;document.getElementById('status-text').textContent=on?'investigating…':'idle'}
@@ -385,7 +393,7 @@ function copyReport(){const t=document.getElementById('report-out').innerText;co
 function copySingle(id){const it=_histData.find(i=>i.id===id);if(!it||!it.report)return;navigator.clipboard.writeText(it.report)}
 function deleteInv(id){if(!confirm('Delete this investigation?'))return;fetch('/history/'+id,{method:'DELETE'}).then(r=>r.json()).then(d=>{if(d.ok){if(_activeId===id){document.getElementById('report-out').innerHTML='<div class="empty-state">Report appears here when you select run.</div>';document.getElementById('report-header-text').textContent='Select an investigation from sidebar';document.getElementById('copy-btn').style.display='none';_activeId=null}_loadHistoryData()}})}
 function copyLive(){const b=document.getElementById('copy-live-btn');navigator.clipboard.writeText(_liveBuffer).then(()=>{b.textContent='Copied!';setTimeout(()=>{b.textContent='Copy'},2000)})}
-function updateSched(){fetch('/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:document.getElementById('sched-on').checked,interval_hours:+document.getElementById('sched-hours').value,hours:+document.getElementById('sched-window').value})}).then(r=>r.json()).then(d=>{document.getElementById('sched-status').textContent=d.enabled?'On — every '+d.interval_hours+'h':'Off'})}
+function updateSched(){fetch('/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:document.getElementById('sched-on').checked,interval_minutes:+document.getElementById('sched-minutes').value,hours:+document.getElementById('sched-window').value})}).then(r=>r.json()).then(d=>{document.getElementById('sched-status').textContent=d.enabled?'On — every '+d.interval_minutes+'m':'Off'})}
 setInterval(_loadHistoryData,15000);_loadHistoryData();
 </script>
 </body>
