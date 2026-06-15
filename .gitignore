@@ -3,3 +3,4 @@
 /docs
 *.pyc
 __pycache__
+investigations.json
