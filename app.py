@@ -28,7 +28,7 @@ class State:
     def __init__(self):
         self.lock       = threading.Lock()   # one investigation at a time
         self.log_file   = ""
-        self.sched_cfg  = {"enabled": False, "interval_minutes": 5, "hours": 24}
+        self.sched_cfg  = {"enabled": False, "interval_minutes": 5, "hours": 4}
         self.sched_wake = threading.Event()
         self.history    = OrderedDict()
         self.hist_lock  = threading.Lock()
@@ -296,7 +296,7 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
 #nl-input::placeholder{color:#667085}
 .filter-row{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
 .btn-primary,.btn-stop{border:none;border-radius:14px;padding:0 18px;font-weight:600;cursor:pointer;min-width:108px}
-.btn-primary{background:linear-gradient(180deg,#2f81f7,#1f6feb);color:#fff}.btn-primary:hover{filter:brightness(1.05)}
+.btn-primary{background:linear-gradient(180deg,#2f81f7,#1f6feb);color:#fff;display:inline-flex;align-items:center;justify-content:center;gap:8px}.btn-primary:hover:not(:disabled){filter:brightness(1.05)}.btn-primary:disabled{opacity:.68;cursor:not-allowed}.btn-primary.loading::before{content:"";width:13px;height:13px;border:2px solid rgba(255,255,255,.38);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
 .btn-stop{background:#da3633;color:#fff}.btn-stop:hover:not(:disabled){filter:brightness(1.05)}
 .preview{display:none;margin-top:12px;padding:12px 14px;border:1px solid var(--line2);border-radius:14px;background:#0b1220}
 .preview .confirm-q{color:var(--text);font-size:14px;margin-bottom:6px}.preview .confirm-note{color:var(--muted);font-size:12px;margin-bottom:10px}.confirm-yes,.confirm-no{padding:8px 14px;border-radius:10px;font-size:12px}.confirm-yes{background:#238636;color:#fff;border:none}.confirm-no{background:#1f2937;color:var(--text);border:1px solid var(--line2);margin-left:8px}
@@ -312,6 +312,7 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
 #report-out .md-p{margin:4px 0;color:#c9d1d9}#report-out .md-ul,#report-out .md-ol{margin:4px 0 8px 4px;padding-left:22px;color:#c9d1d9}#report-out .md-ul li,#report-out .md-ol li{margin:3px 0}#report-out .md-sp{height:8px}#report-out .md-hr{border:none;border-top:1px solid var(--line2);margin:14px 0}#report-out code{background:#111827;border:1px solid var(--line2);border-radius:6px;padding:1px 5px;font-size:12px;color:#79c0ff}#report-out strong{color:#fff}#report-out em{color:#d2a8ff;font-style:italic}#report-out .md-pre{background:#111827;border:1px solid var(--line2);border-radius:14px;padding:10px 12px;overflow-x:auto;font-size:12px;color:#c9d1d9;margin:8px 0;white-space:pre}
 .empty-state{padding:18px;color:var(--muted)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+@keyframes spin{to{transform:rotate(360deg)}}
 @media (max-width: 1100px){.shell{grid-template-columns:1fr}.history-sidebar{order:2}.console-pane{order:1}.hist-list{max-height:240px}.shell.sidebar-collapsed{grid-template-columns:1fr}}
 </style>
 </head>
@@ -336,7 +337,7 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
     <div class="controls">
       <div class="prompt-row">
         <input id="nl-input" type="text" autocomplete="off" spellcheck="false" value="ช่วยวิเคราะห์ alert severity 12 ขึ้นไป ในช่วง 4 ชั่วโมงล่าสุด" placeholder="พิมพ์คำถามด้านความปลอดภัยเป็นภาษาไทย" onkeydown="if(event.key==='Enter')askConfirm()">
-        <button class="btn-primary" onclick="askConfirm()">Run now</button>
+        <button class="btn-primary" id="run-btn" onclick="askConfirm()">Run now</button>
         <button class="btn-stop" id="stop-btn" onclick="stopRun()" disabled>Stop</button>
       </div>
       <div class="filter-row">
@@ -349,15 +350,15 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
       <div class="preview" id="nl-preview"></div>
     </div>
     <div class="toolbar">
-      <span class="toggle-pill">Live investigation first</span>
-      <label class="toggle-pill"><input type="checkbox" id="sched-on" onchange="updateSched()" style="margin-right:6px">Auto triage</label>
-      <span>Every</span>
+      <span class="toggle-pill">วิเคราะห์อัตโนมัติ</span>
+      <label class="toggle-pill"><input type="checkbox" id="sched-on" onchange="updateSched()" style="margin-right:6px">วิเคราะห์อัตโนมัติ</label>
+      <span>ทุก</span>
       <input type="number" id="sched-minutes" value="5" min="1" max="1440" onchange="updateSched()" style="width:70px;background:#0b1220;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:6px 8px">
-      <span>minutes</span>
-      <span>Window</span>
-      <input type="number" id="sched-window" value="24" min="1" max="336" onchange="updateSched()" style="width:70px;background:#0b1220;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:6px 8px">
-      <span>hours</span>
-      <span class="toggle-pill" id="sched-status">Off</span>
+      <span>นาที</span>
+      <span>ย้อนหลัง</span>
+      <input type="number" id="sched-window" value="4" min="1" max="336" onchange="updateSched()" style="width:70px;background:#0b1220;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:6px 8px">
+      <span>ชั่วโมง</span>
+      <span class="toggle-pill" id="sched-status">ปิด</span>
     </div>
     <div class="live-wrap">
       <div class="live-header"><div class="live-dot" id="dot"></div><span class="live-title" id="live-title">Output</span><span class="elapsed" id="elapsed"></span><button id="copy-live-btn" onclick="copyLive()" style="margin-left:auto;font-size:11px;padding:6px 10px;background:#1f2937;color:#c9d1d9;border:1px solid var(--line2);border-radius:10px;cursor:pointer">Copy</button></div>
@@ -383,7 +384,7 @@ function appendLive(kind,text){const out=document.getElementById('live-out');con
 function startAgent(question,hours,level){if(_running)return;const out=document.getElementById('live-out');out.innerHTML='';_liveBuffer='';_curRunId=null;document.getElementById('live-title').textContent='Investigating';switchBadge('running');switchStateDot('running');setRunning(true);_t0=Date.now();_timer=setInterval(()=>{document.getElementById('elapsed').textContent=Math.floor((Date.now()-_t0)/1000)+'s'},1000);const scopedQuestion=question+' (Filter last '+hours+' hours, min level '+level+')';_es=new EventSource('/agent?q='+encodeURIComponent(scopedQuestion));_es.onmessage=(e)=>{const d=e.data;if(d==='__DONE__'){finish(false);return}if(d.startsWith('__RUNID__')){_curRunId=d.slice(9);return}_liveBuffer+=d+'\n';const t=d.trim();if(t.startsWith('[thinking]'))appendLive('thinking',t);else if(t.startsWith('→'))appendLive('tool_call',t);else if(t.startsWith('←'))appendLive('tool_result',t);else if(t.startsWith('[error]'))appendLive('error',t);else if(t.includes('FINAL ASSESSMENT'))appendLive('answer',t);else appendLive('tool_result',t)};_es.onerror=()=>{finish(true)}}
 function stopRun(){fetch('/stop',{method:'POST'});if(_es){_es.close();_es=null}clearInterval(_timer);setRunning(false);document.getElementById('elapsed').textContent='';document.getElementById('live-title').textContent='Output — stopped';switchBadge('stopped');switchStateDot('');const note=document.createElement('div');note.className='stream-row event-error';note.textContent='Stopped by user. A model step already in progress may finish in the background, but its result is discarded.';document.getElementById('live-out').appendChild(note);_loadHistoryData()}
 function finish(err){clearInterval(_timer);if(_es){_es.close();_es=null}setRunning(false);switchBadge(err?'error':'idle');switchStateDot(err?'error':'');document.getElementById('elapsed').textContent='';document.getElementById('live-title').textContent='Output';document.getElementById('last-run').textContent='completed '+new Date().toLocaleTimeString();_loadHistoryData()}
-function setRunning(on){_running=on;document.getElementById('stop-btn').disabled=!on;document.getElementById('status-text').textContent=on?'investigating…':'idle'}
+function setRunning(on){_running=on;const rb=document.getElementById('run-btn');document.getElementById('stop-btn').disabled=!on;rb.disabled=on;rb.classList.toggle('loading',on);rb.textContent=on?'Running…':'Run now';document.getElementById('status-text').textContent=on?'investigating…':'idle'}
 function _loadHistoryData(){return fetch('/history').then(r=>r.json()).then(items=>{_histData=items;_renderHistory();return items})}
 function loadHistory(){_loadHistoryData()}
 function _renderHistory(){const el=document.getElementById('hist-list');document.getElementById('history-count').textContent=String(_histData.length);if(!_histData.length){el.innerHTML='<div class="empty-state">No investigations yet.</div>';return}el.innerHTML=_histData.map(i=>{const active=i.id===_activeId?' active':'';const color=i.status==='error'?'#f85149':i.status==='running'?'#3fb950':i.status==='stopped'?'#f0883e':'#667085';const copyBtn=i.report?'<button class="hbtn" data-copy="'+i.id+'">Copy</button>':'';const delBtn='<button class="hbtn" data-del="'+i.id+'">✕</button>';return '<div class="hi'+active+'" data-id="'+i.id+'"><div class="hl">'+esc(i.label)+'</div><div class="hm"><span class="ds '+i.status+'"></span><span>'+i.started+(i.ended?' — '+i.ended:'')+'</span><span style="margin-left:auto;color:'+color+'">'+i.status+'</span>'+copyBtn+delBtn+'</div></div>'}).join('');el.querySelectorAll('.hi').forEach(div=>div.addEventListener('click',()=>showReport(div.dataset.id)));el.querySelectorAll('[data-copy]').forEach(btn=>btn.addEventListener('click',e=>{e.stopPropagation();copySingle(btn.dataset.copy)}));el.querySelectorAll('[data-del]').forEach(btn=>btn.addEventListener('click',e=>{e.stopPropagation();deleteInv(btn.dataset.del)}))}
@@ -393,7 +394,7 @@ function copyReport(){const t=document.getElementById('report-out').innerText;co
 function copySingle(id){const it=_histData.find(i=>i.id===id);if(!it||!it.report)return;navigator.clipboard.writeText(it.report)}
 function deleteInv(id){if(!confirm('Delete this investigation?'))return;fetch('/history/'+id,{method:'DELETE'}).then(r=>r.json()).then(d=>{if(d.ok){if(_activeId===id){document.getElementById('report-out').innerHTML='<div class="empty-state">Report appears here when you select run.</div>';document.getElementById('report-header-text').textContent='Select an investigation from sidebar';document.getElementById('copy-btn').style.display='none';_activeId=null}_loadHistoryData()}})}
 function copyLive(){const b=document.getElementById('copy-live-btn');navigator.clipboard.writeText(_liveBuffer).then(()=>{b.textContent='Copied!';setTimeout(()=>{b.textContent='Copy'},2000)})}
-function updateSched(){fetch('/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:document.getElementById('sched-on').checked,interval_minutes:+document.getElementById('sched-minutes').value,hours:+document.getElementById('sched-window').value})}).then(r=>r.json()).then(d=>{document.getElementById('sched-status').textContent=d.enabled?'On — every '+d.interval_minutes+'m':'Off'})}
+function updateSched(){fetch('/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:document.getElementById('sched-on').checked,interval_minutes:+document.getElementById('sched-minutes').value,hours:+document.getElementById('sched-window').value})}).then(r=>r.json()).then(d=>{document.getElementById('sched-status').textContent=d.enabled?'เปิด — ทุก '+d.interval_minutes+' นาที':'ปิด'})}
 setInterval(_loadHistoryData,15000);_loadHistoryData();
 </script>
 </body>
